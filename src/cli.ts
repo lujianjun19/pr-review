@@ -1,11 +1,13 @@
 import { prepare } from "./commands/prepare.ts";
-import { note } from "./commands/note.ts";
+import { note, noteBatch } from "./commands/note.ts";
 import { finalize } from "./commands/finalize.ts";
 import { post } from "./commands/post.ts";
+import { recordExec } from "./commands/recordExec.ts";
 import { RunStore } from "./core/store.ts";
 import { showFile, grepAtRev, repoRoot } from "./core/git.ts";
 import { loadRules, rulesForPath, isExcludedByRules } from "./core/rules.ts";
 import { TOOL_VERSION } from "./version.ts";
+import type { VerdictValue } from "./types.ts";
 
 interface ParsedArgs {
   positional: string[];
@@ -23,6 +25,10 @@ function parseArgs(argv: string[]): ParsedArgs {
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--") {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       if (eq > 0) {
@@ -49,6 +55,25 @@ function str(value: string | boolean | undefined): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function parseVerdictExceptions(value: string | undefined): Map<string, VerdictValue> {
+  const result = new Map<string, VerdictValue>();
+  if (!value) return result;
+  for (const entry of value.split(",")) {
+    const separator = entry.lastIndexOf("=");
+    if (separator <= 0) {
+      throw new Error(`Invalid --except entry "${entry}"; expected <path>=findings|cross-batch.`);
+    }
+    const path = entry.slice(0, separator).replace(/^\//, "");
+    const verdict = entry.slice(separator + 1) as VerdictValue;
+    if (verdict !== "findings" && verdict !== "cross-batch") {
+      throw new Error(`Invalid --except verdict "${verdict}" for ${path}.`);
+    }
+    if (result.has(path)) throw new Error(`Duplicate --except path: ${path}.`);
+    result.set(path, verdict);
+  }
+  return result;
+}
+
 const USAGE = `prr ${TOOL_VERSION} — deterministic toolkit for Azure DevOps pull request review
 
 Usage:
@@ -64,6 +89,11 @@ Usage:
 
   prr note --file <path.json> [--dir <run>]
       Record file verdicts and candidate findings from a JSON file.
+
+  prr note --batch <n> --all-clean [--except <path>=findings|cross-batch,...]
+           [--dir <run>]
+      Mark every file in a reviewed batch clean, with explicit exceptions.
+      Refuses to overwrite an existing different verdict.
 
   prr finalize [--render] [--format md|sarif|json] [--dir <run>]
       Verify every finding's evidence against the source revision, resolve its
@@ -93,6 +123,10 @@ Usage:
   prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
       Append a corrected summary to the existing summary thread, so stale
       counts do not stand after a retraction or a later review round.
+
+  prr exec --record [--timeout <seconds>] [--dir <run>] -- <command> [args...]
+      Run one explicit command without a shell and append its redacted, capped
+      result to validations.jsonl. Returns the command's exit code.
 
   prr status [--dir <run>]
       Print the current state of the run.
@@ -201,13 +235,15 @@ async function status(flags: Record<string, string | boolean>): Promise<string> 
   const findings = await store.readFindings();
 
   const reviewable = files.filter((f) => f.decision === "review");
+  const reviewablePaths = new Set(reviewable.map((f) => f.path));
   const done = new Set(verdicts.map((v) => v.path));
+  const covered = [...reviewablePaths].filter((path) => done.has(path)).length;
   const pending = batches.filter((b) => !b.files.every((f) => done.has(f)));
 
   const lines = [
     meta.scope === "ado-pr" ? `PR ${meta.prId} · ${meta.title}` : `${meta.scope} · ${meta.title}`,
     `source ${meta.sourceSHA.slice(0, 10)} · run ${meta.runDir}`,
-    `coverage ${done.size}/${reviewable.length} · findings ${findings.length}`,
+    `coverage ${covered}/${reviewable.length} · findings ${findings.length}`,
   ];
   if (pending.length > 0) {
     lines.push(`pending batches: ${pending.map((b) => `b${String(b.id).padStart(2, "0")}`).join(", ")}`);
@@ -244,6 +280,21 @@ async function main(): Promise<number> {
       return 0;
     }
     case "note": {
+      const batch = num(flags.batch);
+      if (batch !== undefined || flags["all-clean"] === true) {
+        if (batch === undefined || flags["all-clean"] !== true) {
+          throw new Error("Batch recording requires both --batch <n> and --all-clean.");
+        }
+        console.log(
+          await noteBatch({
+            batch,
+            allClean: true,
+            exceptions: parseVerdictExceptions(str(flags.except)),
+            dir: str(flags.dir),
+          }),
+        );
+        return 0;
+      }
       const file = str(flags.file) ?? positional[0];
       if (!file) throw new Error("`prr note` requires --file <path.json>.");
       console.log(await note({ file, dir: str(flags.dir) }));
@@ -268,6 +319,18 @@ async function main(): Promise<number> {
     case "rules":
       console.log(await rulesCheck(positional, flags));
       return 0;
+    case "exec": {
+      if (flags.record !== true) {
+        throw new Error("`prr exec` requires --record; validation commands are never implicit.");
+      }
+      const result = await recordExec({
+        command: positional,
+        dir: str(flags.dir),
+        timeoutSeconds: num(flags.timeout),
+      });
+      console.log(result.output);
+      return result.exitCode;
+    }
     case "post": {
       const severity = str(flags["min-severity"]) as
         | "critical"

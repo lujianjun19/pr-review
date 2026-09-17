@@ -4,6 +4,7 @@ import { annotateDiff } from "./payload.ts";
 import { locate } from "./locate.ts";
 import { classify, riskScore, triage } from "./triage.ts";
 import { buildBatches } from "./batch.ts";
+import { collapseGeneratedDuplicates, normalizeGeneratedContent } from "./generated.ts";
 import { parseGrepOutput } from "./git.ts";
 import type { RawChange } from "./git.ts";
 import type { ChangedFile } from "../types.ts";
@@ -69,6 +70,7 @@ test("classify separates tests, generated output and locks from source", () => {
   assert.equal(classify(change("src/app/user.ts")), "source");
   assert.equal(classify(change("src/app/__tests__/user.test.ts")), "test");
   assert.equal(classify(change("src/api/client.gen.go")), "generated");
+  assert.equal(classify(change("Generated/net8.0/Client.g.cs")), "generated");
   assert.equal(classify(change("package-lock.json")), "lock");
   assert.equal(classify(change("README.md")), "docs");
   assert.equal(classify(change("config/app.yaml")), "config");
@@ -183,4 +185,48 @@ test("parseGrepOutput ignores empty output and malformed lines", () => {
   assert.deepEqual(parseGrepOutput("abc123", ""), []);
   assert.deepEqual(parseGrepOutput("abc123", "abc123:src/a.ts"), []);
   assert.deepEqual(parseGrepOutput("abc123", "abc123:src/a.ts:notanumber:body"), []);
+});
+
+test("generated normalization ignores target-framework conditionals", () => {
+  assert.equal(
+    normalizeGeneratedContent("#if NET8_0\r\npublic class C {}\r\n#endif\r\n"),
+    normalizeGeneratedContent("#if NET10_0\npublic class C {}\n#endif\n"),
+  );
+});
+
+test("duplicate generated files promote one representative and collapse its twins", () => {
+  const files = [
+    file("Generated/net8.0/Client.g.cs", {
+      category: "generated",
+      decision: "stat-only",
+      reason: "generated",
+    }),
+    file("Generated/net10.0/Client.g.cs", {
+      category: "generated",
+      decision: "stat-only",
+      reason: "generated",
+    }),
+    file("Generated/Unique.g.cs", {
+      category: "generated",
+      decision: "stat-only",
+      reason: "generated",
+    }),
+  ];
+  const result = collapseGeneratedDuplicates(
+    files,
+    new Map([
+      ["Generated/net8.0/Client.g.cs", "#if NET8_0\nclass C {}\n#endif"],
+      ["Generated/net10.0/Client.g.cs", "#if NET10_0\nclass C {}\n#endif"],
+      ["Generated/Unique.g.cs", "#if NET8_0\nclass U {}\n#endif"],
+    ]),
+  );
+  const representative = result.find((f) => f.path.endsWith("net10.0/Client.g.cs"))!;
+  const twin = result.find((f) => f.path.endsWith("net8.0/Client.g.cs"))!;
+  const unique = result.find((f) => f.path.endsWith("Unique.g.cs"))!;
+  assert.equal(representative.decision, "review");
+  assert.equal(representative.reason, "generated-representative");
+  assert.equal(twin.decision, "stat-only");
+  assert.equal(twin.reason, `duplicate-of:${representative.path}`);
+  assert.equal(unique.decision, "stat-only");
+  assert.equal(unique.reason, "generated");
 });

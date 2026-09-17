@@ -84,8 +84,11 @@ var AdoClient = class {
     return `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}/_apis/git/repositories/${encodeURIComponent(repo)}`;
   }
   async request(path, init) {
-    const cred = await getCredential();
     const url = `${this.base()}${path}${path.includes("?") ? "&" : "?"}api-version=${API_VERSION}`;
+    return this.requestUrl(url, init);
+  }
+  async requestUrl(url, init) {
+    const cred = await getCredential();
     const res = await fetch(url, {
       ...init,
       headers: {
@@ -127,6 +130,18 @@ ${body}`);
   async listThreads(prId) {
     const res = await this.request(`/pullRequests/${prId}/threads`);
     return (res.value ?? []).map(normalizeThread);
+  }
+  async listPullRequestStatuses(prId) {
+    const res = await this.request(`/pullRequests/${prId}/statuses`);
+    return res.value ?? [];
+  }
+  async listPolicyEvaluations(prId, projectId) {
+    const { org, project } = this.target;
+    const artifactId = `vstfs:///CodeReview/CodeReviewId/${projectId}/${prId}`;
+    const query = new URLSearchParams({ artifactId, "api-version": "7.1-preview.1" });
+    const url = `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}/_apis/policy/evaluations?${query.toString()}`;
+    const res = await this.requestUrl(url);
+    return res.value ?? [];
   }
   /** Creates a comment thread. The body is sent as JSON, so emoji survive intact. */
   createThread(prId, body) {
@@ -635,6 +650,7 @@ var GENERATED_PATTERNS = [
   /\.map$/,
   /\.snap$/,
   /(^|\/)[^/]*\.designer\.cs$/i,
+  /\.g\.[^/]+$/i,
   /(^|\/)migrations?\/.*\.(designer\.cs|resx)$/i
 ];
 var TEST_PATTERNS = [
@@ -970,6 +986,53 @@ async function renderPayload(batch, ctx) {
   return parts.join("\n");
 }
 
+// src/core/generated.ts
+import { createHash } from "node:crypto";
+function normalizeGeneratedContent(content) {
+  return content.replace(/^#if NET\d+_\d+\s*$/gm, "#if NET_TARGET").replace(/\r\n/g, "\n").trim();
+}
+function contentHash(content) {
+  return createHash("sha256").update(normalizeGeneratedContent(content)).digest("hex");
+}
+function collapseGeneratedDuplicates(files, contents) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const file of files) {
+    if (file.category !== "generated" || file.status === "delete") continue;
+    const content = contents.get(file.path);
+    if (!content) continue;
+    const hash = contentHash(content);
+    const group = groups.get(hash) ?? [];
+    group.push(file.path);
+    groups.set(hash, group);
+  }
+  const representativeByPath = /* @__PURE__ */ new Map();
+  for (const paths of groups.values()) {
+    if (paths.length < 2) continue;
+    paths.sort((a, b) => a.localeCompare(b));
+    const representative = paths[0];
+    for (const path of paths) representativeByPath.set(path, representative);
+  }
+  return files.map((file) => {
+    const representative = representativeByPath.get(file.path);
+    if (!representative) return file;
+    if (file.path === representative) {
+      return {
+        ...file,
+        decision: "review",
+        reason: "generated-representative",
+        // Generated contracts are reviewed after handwritten source, but no
+        // longer disappear entirely from semantic coverage.
+        risk: Math.max(1, file.risk)
+      };
+    }
+    return {
+      ...file,
+      decision: "stat-only",
+      reason: `duplicate-of:${representative}`
+    };
+  });
+}
+
 // src/core/store.ts
 import { mkdir, readFile as readFile3, writeFile, appendFile, readdir } from "node:fs/promises";
 import { existsSync as existsSync2 } from "node:fs";
@@ -1014,10 +1077,19 @@ async function findLatestRun(cwd) {
   if (candidates.length === 0) {
     throw new Error("No prepared run found. Run `prr prepare <pr>` first.");
   }
-  const local = here ? candidates.filter((c) => c.repoRoot === here) : [];
-  const pool = local.length > 0 ? local : candidates;
-  pool.sort((a, b) => b.at - a.at);
-  return pool[0].dir;
+  if (!here) {
+    throw new Error(
+      "Cannot infer a review run outside a git repository. Pass --dir <run-directory> explicitly."
+    );
+  }
+  const local = candidates.filter((c) => c.repoRoot === here);
+  if (local.length === 0) {
+    throw new Error(
+      `No prepared run matches the current repository (${here}). Run \`prr prepare\` here, or pass --dir <run-directory> explicitly.`
+    );
+  }
+  local.sort((a, b) => b.at - a.at);
+  return local[0].dir;
 }
 async function writeJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}
@@ -1062,6 +1134,12 @@ var RunStore = class _RunStore {
   writeThreads(threads) {
     return writeJson(this.path("threads.json"), threads);
   }
+  writePolicies(value) {
+    return writeJson(this.path("policies.json"), value);
+  }
+  writeBuilds(value) {
+    return writeJson(this.path("builds.json"), value);
+  }
   readThreads() {
     return readJson(this.path("threads.json"), []);
   }
@@ -1082,6 +1160,13 @@ var RunStore = class _RunStore {
   }
   readVerdicts() {
     return readJsonl(this.path("verdicts.jsonl"));
+  }
+  async appendValidation(record) {
+    await appendFile(this.path("validations.jsonl"), `${JSON.stringify(record)}
+`, "utf8");
+  }
+  readValidations() {
+    return readJsonl(this.path("validations.jsonl"));
   }
   async appendVerdicts(verdicts) {
     if (verdicts.length === 0) return;
@@ -1122,7 +1207,7 @@ var RunStore = class _RunStore {
 };
 
 // src/version.ts
-var TOOL_VERSION = "0.2.0";
+var TOOL_VERSION = "0.3.0";
 
 // src/commands/prepare.ts
 async function resolveTarget(target, cwd) {
@@ -1140,6 +1225,17 @@ async function resolveTarget(target, cwd) {
     );
   }
   return { ...fromRemote, prId };
+}
+async function optionalEvidence(load) {
+  try {
+    return { available: true, items: await load() };
+  } catch (err) {
+    return {
+      available: false,
+      items: [],
+      error: err.message.slice(0, 300)
+    };
+  }
 }
 async function prepareAdoScope(args, root) {
   const target = await resolveTarget(args.target, root);
@@ -1160,9 +1256,17 @@ async function prepareAdoScope(args, root) {
   const sourceSHA = iteration.sourceRefCommit.commitId;
   const targetSHA = iteration.targetRefCommit.commitId;
   const baseSHA = iteration.commonRefCommit.commitId;
-  const [threads, changeEntries] = await Promise.all([
+  const projectId = pr.repository?.project?.id;
+  const unavailablePolicies = {
+    available: false,
+    items: [],
+    error: projectId ? void 0 : "Pull request metadata did not include a project id."
+  };
+  const [threads, changeEntries, builds, policies] = await Promise.all([
     client.listThreads(target.prId),
-    client.listIterationChanges(target.prId, iteration.id, args.since)
+    client.listIterationChanges(target.prId, iteration.id, args.since),
+    optionalEvidence(() => client.listPullRequestStatuses(target.prId)),
+    projectId ? optionalEvidence(() => client.listPolicyEvaluations(target.prId, projectId)) : Promise.resolve(unavailablePolicies)
   ]);
   const cred = await getCredential();
   await fetchCommits(root, remoteUrlFor(target), [sourceSHA, baseSHA], cred.header);
@@ -1181,6 +1285,7 @@ async function prepareAdoScope(args, root) {
       scope: "ado-pr",
       org: target.org,
       project: target.project,
+      ...projectId ? { projectId } : {},
       repo: target.repo,
       repoId: pr.repository?.id ?? "",
       prId: target.prId,
@@ -1215,6 +1320,8 @@ async function prepareAdoScope(args, root) {
         sourceSHA: it.sourceRefCommit.commitId
       }))
     },
+    policies,
+    builds,
     credentialSource: cred.source
   };
 }
@@ -1279,7 +1386,17 @@ async function prepare(args) {
   if (args.since !== void 0 && scope.iterationPaths) {
     changes = changes.filter((c) => scope.iterationPaths.has(c.path));
   }
-  const files = triage(changes, scope.trackingIds, { maxFileTokens: 6e4, rules });
+  let files = triage(changes, scope.trackingIds, { maxFileTokens: 6e4, rules });
+  const generated = files.filter((file) => file.category === "generated");
+  if (generated.length > 1) {
+    const contentPairs = await Promise.all(
+      generated.map(async (file) => [
+        file.path,
+        await showFile(root, scope.meta.sourceSHA, file.path)
+      ])
+    );
+    files = collapseGeneratedDuplicates(files, new Map(contentPairs));
+  }
   const batches = buildBatches(files, {
     maxFiles: args.maxFiles ?? 10,
     maxTokens: args.maxTokens ?? 25e3,
@@ -1296,6 +1413,8 @@ async function prepare(args) {
   const carried = await store.carriedProgress();
   if (args.reset) await store.resetProgress();
   if (scope.pullRequest) await store.writePullRequest(scope.pullRequest);
+  if (scope.policies) await store.writePolicies(scope.policies);
+  if (scope.builds) await store.writeBuilds(scope.builds);
   await store.writeThreads(scope.threads);
   await store.writeFiles(files);
   await store.writeBatches(batches);
@@ -1317,10 +1436,23 @@ async function prepare(args) {
     scope.threads.length,
     scope.credentialSource,
     args.reset ? 0 : carried,
-    rules.sources
+    rules.sources,
+    scope.policies,
+    scope.builds
   );
 }
-function formatSummary(meta, files, batches, threadCount, credSource, carried, ruleSources) {
+function evidenceSummary(evidence) {
+  if (!evidence) return "not applicable";
+  if (!evidence.available) return `unavailable (${evidence.error ?? "request failed"})`;
+  if (evidence.items.length === 0) return "none reported";
+  const counts = /* @__PURE__ */ new Map();
+  for (const item of evidence.items) {
+    const state = (item.status ?? item.state ?? "unknown").toLowerCase();
+    counts.set(state, (counts.get(state) ?? 0) + 1);
+  }
+  return [...counts].map(([state, count]) => `${state} x${count}`).join(", ");
+}
+function formatSummary(meta, files, batches, threadCount, credSource, carried, ruleSources, policies, builds) {
   const counts = { review: 0, "stat-only": 0, skip: 0 };
   for (const f of files) counts[f.decision]++;
   const lines = [];
@@ -1352,6 +1484,10 @@ function formatSummary(meta, files, batches, threadCount, credSource, carried, r
   if (ruleSources.length > 0) {
     lines.push(`  rules: ${ruleSources.join(", ")}`);
   }
+  if (meta.scope === "ado-pr") {
+    lines.push(`  policies: ${evidenceSummary(policies)}`);
+    lines.push(`  PR statuses/builds: ${evidenceSummary(builds)}`);
+  }
   lines.push("");
   lines.push(`batches ${batches.length} (highest risk first):`);
   for (const batch of batches) {
@@ -1372,7 +1508,7 @@ function formatSummary(meta, files, batches, threadCount, credSource, carried, r
 
 // src/commands/note.ts
 import { readFile as readFile4 } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 
 // src/core/findingVerification.ts
 var VERIFICATION_METHODS = [
@@ -1412,7 +1548,7 @@ function fail(message) {
 }
 function fingerprint(path, evidence, problem) {
   const normalized = `${path}|${evidence.replace(/\s+/g, " ").trim()}|${problem.replace(/\s+/g, " ").trim().slice(0, 120)}`;
-  return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
+  return createHash2("sha1").update(normalized).digest("hex").slice(0, 12);
 }
 function validateVerification(raw, where) {
   if (raw === void 0) return void 0;
@@ -1468,6 +1604,58 @@ function validateFinding(raw, index, knownPaths) {
     batch: raw.batch,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
+}
+async function noteBatch(args) {
+  if (!args.allClean) {
+    throw new Error("Batch recording currently requires --all-clean.");
+  }
+  const store = await RunStore.open(args.dir);
+  const batches = await store.readBatches();
+  const batch = batches.find((candidate) => candidate.id === args.batch);
+  if (!batch) {
+    throw new Error(
+      `Batch ${args.batch} not found; available: ${batches.map((b) => b.id).join(", ") || "none"}.`
+    );
+  }
+  for (const [path, verdict] of args.exceptions) {
+    if (!batch.files.includes(path)) {
+      throw new Error(`--except path "${path}" is not in batch ${args.batch}.`);
+    }
+    if (!VERDICTS.includes(verdict)) {
+      throw new Error(`--except verdict must be one of ${VERDICTS.join(", ")}.`);
+    }
+  }
+  const existing = await store.readVerdicts();
+  const latest = new Map(existing.map((entry) => [entry.path, entry.verdict]));
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const additions = [];
+  let unchanged = 0;
+  for (const path of batch.files) {
+    const requested = args.exceptions.get(path) ?? "clean";
+    const current = latest.get(path);
+    if (current !== void 0) {
+      if (current !== requested) {
+        throw new Error(
+          `Refusing to change ${path} from "${current}" to "${requested}". Record the correction explicitly with \`prr note --file\`.`
+        );
+      }
+      unchanged++;
+      continue;
+    }
+    additions.push({
+      path,
+      batch: batch.id,
+      verdict: requested,
+      at: now
+    });
+  }
+  await store.appendVerdicts(additions);
+  const meta = await store.meta();
+  return [
+    `${meta.scope === "ado-pr" ? `PR ${meta.prId}` : meta.scope} \xB7 ${meta.sourceSHA.slice(0, 10)}`,
+    `batch ${batch.id}: recorded ${additions.length} verdict(s), ${unchanged} already identical`,
+    `  clean ${additions.filter((v) => v.verdict === "clean").length}, findings ${additions.filter((v) => v.verdict === "findings").length}, cross-batch ${additions.filter((v) => v.verdict === "cross-batch").length}`
+  ].join("\n");
 }
 async function note(args) {
   const store = await RunStore.open(args.dir);
@@ -1535,7 +1723,8 @@ async function note(args) {
     lines.push(`  severities: ${[...bySeverity].map(([s, n]) => `${s} x${n}`).join(", ")}`);
   }
   const done = new Set((await store.readVerdicts()).map((v) => v.path));
-  lines.push(`coverage: ${done.size}/${reviewable.size} reviewable files have a verdict`);
+  const covered = [...reviewable].filter((path) => done.has(path)).length;
+  lines.push(`coverage: ${covered}/${reviewable.size} reviewable files have a verdict`);
   return lines.join("\n");
 }
 
@@ -1734,6 +1923,7 @@ async function finalize(args) {
   const threads = await store.readThreads();
   const findings = await store.readFindings();
   const verdicts = await store.readVerdicts();
+  const validations = await store.readValidations();
   const reviewable = files.filter((f) => f.decision === "review");
   const reviewablePaths = reviewable.map((f) => f.path);
   const verified = [];
@@ -1797,8 +1987,10 @@ async function finalize(args) {
   await store.replaceFindings(verified);
   const lastVerdict = /* @__PURE__ */ new Map();
   for (const v of verdicts) lastVerdict.set(v.path, v.verdict);
+  const reviewableSet = new Set(reviewablePaths);
+  const covered = reviewablePaths.filter((path) => lastVerdict.has(path)).length;
   const missing = reviewablePaths.filter((p) => !lastVerdict.has(p));
-  const crossBatch = [...lastVerdict].filter(([, v]) => v === "cross-batch").map(([p]) => p);
+  const crossBatch = [...lastVerdict].filter(([path, verdict]) => reviewableSet.has(path) && verdict === "cross-batch").map(([path]) => path);
   const publishable = verified.filter((f) => f.status === "verified");
   const blocked = verified.filter(
     (f) => f.status !== "verified" && f.status !== "duplicate" && f.status !== "retracted"
@@ -1815,7 +2007,15 @@ async function finalize(args) {
   lines.push(
     `findings: ${publishable.length} verified, ${blocked.length} not publishable, ${verified.filter((f) => f.status === "duplicate").length} marked duplicate, ${verified.filter((f) => f.status === "retracted").length} retracted`
   );
-  lines.push(`coverage: ${lastVerdict.size}/${reviewablePaths.length} reviewable files`);
+  lines.push(`coverage: ${covered}/${reviewablePaths.length} reviewable files`);
+  if (validations.length > 0) {
+    const passed = validations.filter((record) => record.exitCode === 0).length;
+    const failed = validations.length - passed;
+    lines.push(`validations: ${validations.length} recorded \xB7 ${passed} passed \xB7 ${failed} failed`);
+    for (const record of validations.filter((item) => item.exitCode !== 0).slice(0, 5)) {
+      lines.push(`  exit ${record.exitCode}: ${record.command.join(" ")}`);
+    }
+  }
   if (notes.length > 0) {
     lines.push("verification notes:");
     lines.push(...notes.slice(0, 15));
@@ -1886,7 +2086,7 @@ ${footer}`;
 // src/commands/post.ts
 import { readFile as readFile5, writeFile as writeFile2 } from "node:fs/promises";
 import { existsSync as existsSync3 } from "node:fs";
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 var SEVERITY_LABEL2 = {
   critical: "\u{1F534} **Critical**",
   high: "\u{1F7E0} **High**",
@@ -2138,8 +2338,8 @@ async function updateSummary(ctx) {
     throw new Error("--update-summary requires --summary <path.md> with the corrected text.");
   }
   const content = await readFile5(args.summaryFile, "utf8");
-  const contentHash = summaryHash(content);
-  const updateKey = `summary:${contentHash}`;
+  const contentHash2 = summaryHash(content);
+  const updateKey = `summary:${contentHash2}`;
   const threadId = ledger[SUMMARY_KEY];
   if (threadId === void 0) {
     if (args.dryRun) {
@@ -2155,18 +2355,113 @@ async function updateSummary(ctx) {
     return `no existing summary thread; summary posted as thread ${thread.id}`;
   }
   if (ledger[updateKey] !== void 0) {
-    return `summary correction already posted to thread ${threadId} (content ${contentHash})`;
+    return `summary correction already posted to thread ${threadId} (content ${contentHash2})`;
   }
   if (args.dryRun) {
-    return `dry run: a correction would be appended to summary thread ${threadId} on PR ${prId} (content ${contentHash})`;
+    return `dry run: a correction would be appended to summary thread ${threadId} on PR ${prId} (content ${contentHash2})`;
   }
   await client.replyToThread(prId, threadId, content);
   ledger[updateKey] = threadId;
   await saveLedger();
-  return `summary correction appended to thread ${threadId} (content ${contentHash})`;
+  return `summary correction appended to thread ${threadId} (content ${contentHash2})`;
 }
 function summaryHash(content) {
-  return createHash2("sha256").update(content).digest("hex").slice(0, 16);
+  return createHash3("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+// src/commands/recordExec.ts
+import { spawn } from "node:child_process";
+var MAX_CAPTURE_CHARS = 16e3;
+var SECRET_ENV_KEYS = [
+  "AZURE_DEVOPS_EXT_PAT",
+  "AZURE_DEVOPS_PAT",
+  "SYSTEM_ACCESSTOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN"
+];
+function redact(text) {
+  let result = text;
+  for (const key of SECRET_ENV_KEYS) {
+    const secret = process.env[key];
+    if (secret) result = result.split(secret).join("[REDACTED]");
+  }
+  return result.replace(/\bgh[opusr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]").replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_JWT]").replace(/(https?:\/\/)[^/@\s]+:[^/@\s]+@/g, "$1[REDACTED]@").replace(
+    /^([^\n=]*(?:TOKEN|PASSWORD|SECRET|API_KEY)[^\n=]*)=.*$/gim,
+    "$1=[REDACTED]"
+  );
+}
+function truncate(text) {
+  if (text.length <= MAX_CAPTURE_CHARS) return text;
+  const omitted = text.length - MAX_CAPTURE_CHARS;
+  return `[... ${omitted} character(s) omitted ...]
+${text.slice(-MAX_CAPTURE_CHARS)}`;
+}
+function commandLabel(command) {
+  return command.map((part) => /[\s"']/.test(part) ? JSON.stringify(part) : part).join(" ");
+}
+async function recordExec(args) {
+  if (args.command.length === 0) {
+    throw new Error("`prr exec --record` requires a command after `--`.");
+  }
+  const store = await RunStore.open(args.dir);
+  const meta = await store.meta();
+  const [executable, ...commandArgs] = args.command;
+  const started = Date.now();
+  const startedAt = new Date(started).toISOString();
+  const timeoutMs = Math.max(1, args.timeoutSeconds ?? 300) * 1e3;
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  const exitCode = await new Promise((resolve) => {
+    const child = spawn(executable, commandArgs, {
+      cwd: meta.repoRoot,
+      env: process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (err) => {
+      stderr += `${err.message}
+`;
+      resolve(127);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(timedOut ? 124 : code ?? 1);
+    });
+  });
+  const record = {
+    command: args.command.map(redact),
+    cwd: meta.repoRoot,
+    sourceSHA: meta.sourceSHA,
+    startedAt,
+    durationMs: Date.now() - started,
+    exitCode,
+    timedOut,
+    stdout: truncate(redact(stdout.trimEnd())),
+    stderr: truncate(redact(stderr.trimEnd()))
+  };
+  await store.appendValidation(record);
+  return {
+    output: [
+      `${meta.scope === "ado-pr" ? `PR ${meta.prId}` : meta.scope} \xB7 ${meta.sourceSHA.slice(0, 10)}`,
+      `validation: ${commandLabel(record.command)}`,
+      `exit ${exitCode} \xB7 ${record.durationMs} ms${timedOut ? " \xB7 timed out" : ""}`,
+      `recorded: ${store.path("validations.jsonl")}`
+    ].join("\n"),
+    exitCode
+  };
 }
 
 // src/cli.ts
@@ -2177,6 +2472,10 @@ function parseArgs(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--") {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       if (eq > 0) {
@@ -2200,6 +2499,24 @@ function num(value) {
 function str(value) {
   return typeof value === "string" ? value : void 0;
 }
+function parseVerdictExceptions(value) {
+  const result = /* @__PURE__ */ new Map();
+  if (!value) return result;
+  for (const entry of value.split(",")) {
+    const separator = entry.lastIndexOf("=");
+    if (separator <= 0) {
+      throw new Error(`Invalid --except entry "${entry}"; expected <path>=findings|cross-batch.`);
+    }
+    const path = entry.slice(0, separator).replace(/^\//, "");
+    const verdict = entry.slice(separator + 1);
+    if (verdict !== "findings" && verdict !== "cross-batch") {
+      throw new Error(`Invalid --except verdict "${verdict}" for ${path}.`);
+    }
+    if (result.has(path)) throw new Error(`Duplicate --except path: ${path}.`);
+    result.set(path, verdict);
+  }
+  return result;
+}
 var USAGE = `prr ${TOOL_VERSION} \u2014 deterministic toolkit for Azure DevOps pull request review
 
 Usage:
@@ -2215,6 +2532,11 @@ Usage:
 
   prr note --file <path.json> [--dir <run>]
       Record file verdicts and candidate findings from a JSON file.
+
+  prr note --batch <n> --all-clean [--except <path>=findings|cross-batch,...]
+           [--dir <run>]
+      Mark every file in a reviewed batch clean, with explicit exceptions.
+      Refuses to overwrite an existing different verdict.
 
   prr finalize [--render] [--format md|sarif|json] [--dir <run>]
       Verify every finding's evidence against the source revision, resolve its
@@ -2244,6 +2566,10 @@ Usage:
   prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
       Append a corrected summary to the existing summary thread, so stale
       counts do not stand after a retraction or a later review round.
+
+  prr exec --record [--timeout <seconds>] [--dir <run>] -- <command> [args...]
+      Run one explicit command without a shell and append its redacted, capped
+      result to validations.jsonl. Returns the command's exit code.
 
   prr status [--dir <run>]
       Print the current state of the run.
@@ -2323,12 +2649,14 @@ async function status(flags) {
   const verdicts = await store.readVerdicts();
   const findings = await store.readFindings();
   const reviewable = files.filter((f) => f.decision === "review");
+  const reviewablePaths = new Set(reviewable.map((f) => f.path));
   const done = new Set(verdicts.map((v) => v.path));
+  const covered = [...reviewablePaths].filter((path) => done.has(path)).length;
   const pending = batches.filter((b) => !b.files.every((f) => done.has(f)));
   const lines = [
     meta.scope === "ado-pr" ? `PR ${meta.prId} \xB7 ${meta.title}` : `${meta.scope} \xB7 ${meta.title}`,
     `source ${meta.sourceSHA.slice(0, 10)} \xB7 run ${meta.runDir}`,
-    `coverage ${done.size}/${reviewable.length} \xB7 findings ${findings.length}`
+    `coverage ${covered}/${reviewable.length} \xB7 findings ${findings.length}`
   ];
   if (pending.length > 0) {
     lines.push(`pending batches: ${pending.map((b) => `b${String(b.id).padStart(2, "0")}`).join(", ")}`);
@@ -2363,6 +2691,21 @@ async function main() {
       return 0;
     }
     case "note": {
+      const batch = num(flags.batch);
+      if (batch !== void 0 || flags["all-clean"] === true) {
+        if (batch === void 0 || flags["all-clean"] !== true) {
+          throw new Error("Batch recording requires both --batch <n> and --all-clean.");
+        }
+        console.log(
+          await noteBatch({
+            batch,
+            allClean: true,
+            exceptions: parseVerdictExceptions(str(flags.except)),
+            dir: str(flags.dir)
+          })
+        );
+        return 0;
+      }
       const file = str(flags.file) ?? positional[0];
       if (!file) throw new Error("`prr note` requires --file <path.json>.");
       console.log(await note({ file, dir: str(flags.dir) }));
@@ -2387,6 +2730,18 @@ async function main() {
     case "rules":
       console.log(await rulesCheck(positional, flags));
       return 0;
+    case "exec": {
+      if (flags.record !== true) {
+        throw new Error("`prr exec` requires --record; validation commands are never implicit.");
+      }
+      const result = await recordExec({
+        command: positional,
+        dir: str(flags.dir),
+        timeoutSeconds: num(flags.timeout)
+      });
+      console.log(result.output);
+      return result.exitCode;
+    }
     case "post": {
       const severity = str(flags["min-severity"]);
       const retractFlag = flags.retract;

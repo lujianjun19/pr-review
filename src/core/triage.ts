@@ -45,6 +45,7 @@ const GENERATED_PATTERNS = [
   /\.map$/,
   /\.snap$/,
   /(^|\/)[^/]*\.designer\.cs$/i,
+  /\.g\.[^/]+$/i,
   /(^|\/)migrations?\/.*\.(designer\.cs|resx)$/i,
 ];
 

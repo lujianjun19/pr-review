@@ -13,7 +13,11 @@ export interface PullRequest {
   createdBy?: { displayName?: string };
   sourceRefName: string;
   targetRefName: string;
-  repository: { id: string; name: string };
+  repository: {
+    id: string;
+    name: string;
+    project?: { id?: string; name?: string };
+  };
   labels?: { name: string }[];
 }
 
@@ -30,6 +34,27 @@ export interface IterationChange {
   changeTrackingId?: number;
   changeType: string;
   item: { path?: string; originalPath?: string; isFolder?: boolean };
+}
+
+export interface PullRequestStatus {
+  id?: number;
+  state: string;
+  description?: string;
+  context?: { name?: string; genre?: string };
+  creationDate?: string;
+  updatedDate?: string;
+  targetUrl?: string;
+}
+
+export interface PolicyEvaluation {
+  evaluationId?: string;
+  status: string;
+  configuration?: {
+    id?: number;
+    isBlocking?: boolean;
+    type?: { id?: string; displayName?: string };
+  };
+  context?: Record<string, unknown>;
 }
 
 /** Thin Azure DevOps Git REST client. Native fetch only, no dependencies. */
@@ -49,8 +74,12 @@ export class AdoClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
-    const cred = await getCredential();
     const url = `${this.base()}${path}${path.includes("?") ? "&" : "?"}api-version=${API_VERSION}`;
+    return this.requestUrl<T>(url, init);
+  }
+
+  private async requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
+    const cred = await getCredential();
     const res = await fetch(url, {
       ...init,
       headers: {
@@ -101,6 +130,22 @@ export class AdoClient {
   async listThreads(prId: number): Promise<ReviewThread[]> {
     const res = await this.request<{ value: RawThread[] }>(`/pullRequests/${prId}/threads`);
     return (res.value ?? []).map(normalizeThread);
+  }
+
+  async listPullRequestStatuses(prId: number): Promise<PullRequestStatus[]> {
+    const res = await this.request<{ value: PullRequestStatus[] }>(`/pullRequests/${prId}/statuses`);
+    return res.value ?? [];
+  }
+
+  async listPolicyEvaluations(prId: number, projectId: string): Promise<PolicyEvaluation[]> {
+    const { org, project } = this.target;
+    const artifactId = `vstfs:///CodeReview/CodeReviewId/${projectId}/${prId}`;
+    const query = new URLSearchParams({ artifactId, "api-version": "7.1-preview.1" });
+    const url =
+      `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}` +
+      `/_apis/policy/evaluations?${query.toString()}`;
+    const res = await this.requestUrl<{ value: PolicyEvaluation[] }>(url);
+    return res.value ?? [];
   }
 
   /** Creates a comment thread. The body is sent as JSON, so emoji survive intact. */

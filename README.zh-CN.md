@@ -4,8 +4,8 @@
 
 本项目把**可确定的审查工作下沉到代码**，让 Agent 只负责语义判断：
 
-- 固定 Azure DevOps PR iteration 和 commit SHA
-- 识别、筛选、排序和分批变更文件
+- 固定 Azure DevOps PR iteration 和 commit SHA，并在可用时保存 policy/PR-status 信号
+- 识别、筛选、排序和分批变更文件；多目标重复生成文件只审一个代表
 - 生成带真实源文件行号的 diff payload
 - 从 source revision 验证 finding 的证据
 - 检查文件覆盖率、去重候选和评论位置
@@ -41,6 +41,8 @@ node bin/prr.mjs context --path src/example.ts --start 40
 node bin/prr.mjs grep createOrder --files-only
 node bin/prr.mjs rules check src/example.ts
 node bin/prr.mjs note --file findings.json
+node bin/prr.mjs note --batch 2 --all-clean --except src/app.ts=findings
+node bin/prr.mjs exec --record --timeout 300 -- npm test
 node bin/prr.mjs finalize
 node bin/prr.mjs finalize --format sarif > findings.sarif
 node bin/prr.mjs post --dry-run
@@ -48,7 +50,9 @@ node bin/prr.mjs post --retract <finding-id> --dry-run
 node bin/prr.mjs post --update-summary --summary corrected.md --dry-run
 ```
 
-审查状态默认保存在用户缓存目录，不写入被审仓库：
+审查状态默认保存在用户缓存目录，不写入被审仓库。后续命令只会自动选择当前 git 仓库对应的 run；
+在仓库外运行时必须显式传入 `--dir`，不会回退到其他仓库最近的 run。Azure DevOps policy/status
+证据写入 `policies.json`/`builds.json`，验证命令写入 `validations.jsonl`：
 
 ```text
 ${XDG_CACHE_HOME:-~/.cache}/pr-review/<run-key>/

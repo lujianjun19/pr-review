@@ -2,6 +2,7 @@ import { AdoClient } from "../ado/client.ts";
 import { getCredential } from "../ado/auth.ts";
 import { parsePrUrl, parseRemoteUrl, remoteUrlFor, webUrlFor } from "../ado/url.ts";
 import type { AdoTarget } from "../ado/url.ts";
+import type { PolicyEvaluation, PullRequestStatus } from "../ado/client.ts";
 import {
   WORKTREE,
   fetchCommits,
@@ -11,11 +12,13 @@ import {
   repoRoot,
   revParse,
   currentBranch,
+  showFile,
 } from "../core/git.ts";
 import { triage } from "../core/triage.ts";
 import { buildBatches } from "../core/batch.ts";
 import { renderPayload } from "../core/payload.ts";
 import { loadRules } from "../core/rules.ts";
+import { collapseGeneratedDuplicates } from "../core/generated.ts";
 import { RunStore, runDirFor } from "../core/store.ts";
 import type { ChangedFile, ReviewScope, ReviewThread, RunMeta } from "../types.ts";
 import { TOOL_VERSION } from "../version.ts";
@@ -60,6 +63,12 @@ async function resolveTarget(
   return { ...fromRemote, prId };
 }
 
+interface OptionalEvidence<T> {
+  available: boolean;
+  items: T[];
+  error?: string;
+}
+
 interface ScopeResult {
   meta: Omit<RunMeta, "runDir" | "ruleSources">;
   threads: ReviewThread[];
@@ -67,7 +76,21 @@ interface ScopeResult {
   /** Paths the Azure DevOps iteration reports as changed, for incremental runs. */
   iterationPaths?: Set<string>;
   pullRequest?: unknown;
+  policies?: OptionalEvidence<PolicyEvaluation>;
+  builds?: OptionalEvidence<PullRequestStatus>;
   credentialSource: string;
+}
+
+async function optionalEvidence<T>(load: () => Promise<T[]>): Promise<OptionalEvidence<T>> {
+  try {
+    return { available: true, items: await load() };
+  } catch (err) {
+    return {
+      available: false,
+      items: [],
+      error: (err as Error).message.slice(0, 300),
+    };
+  }
 }
 
 /** Pins an Azure DevOps pull request iteration and fetches its evidence. */
@@ -98,9 +121,19 @@ async function prepareAdoScope(args: PrepareArgs, root: string): Promise<ScopeRe
   // here has to re-derive one from local history that may not even be present.
   const baseSHA = iteration.commonRefCommit.commitId;
 
-  const [threads, changeEntries] = await Promise.all([
+  const projectId = pr.repository?.project?.id;
+  const unavailablePolicies: OptionalEvidence<PolicyEvaluation> = {
+    available: false,
+    items: [],
+    error: projectId ? undefined : "Pull request metadata did not include a project id.",
+  };
+  const [threads, changeEntries, builds, policies] = await Promise.all([
     client.listThreads(target.prId),
     client.listIterationChanges(target.prId, iteration.id, args.since),
+    optionalEvidence(() => client.listPullRequestStatuses(target.prId)),
+    projectId
+      ? optionalEvidence(() => client.listPolicyEvaluations(target.prId, projectId))
+      : Promise.resolve(unavailablePolicies),
   ]);
 
   const cred = await getCredential();
@@ -122,6 +155,7 @@ async function prepareAdoScope(args: PrepareArgs, root: string): Promise<ScopeRe
       scope: "ado-pr",
       org: target.org,
       project: target.project,
+      ...(projectId ? { projectId } : {}),
       repo: target.repo,
       repoId: pr.repository?.id ?? "",
       prId: target.prId,
@@ -156,6 +190,8 @@ async function prepareAdoScope(args: PrepareArgs, root: string): Promise<ScopeRe
         sourceSHA: it.sourceRefCommit.commitId,
       })),
     },
+    policies,
+    builds,
     credentialSource: cred.source,
   };
 }
@@ -233,7 +269,17 @@ export async function prepare(args: PrepareArgs): Promise<string> {
     changes = changes.filter((c) => scope.iterationPaths!.has(c.path));
   }
 
-  const files = triage(changes, scope.trackingIds, { maxFileTokens: 60_000, rules });
+  let files = triage(changes, scope.trackingIds, { maxFileTokens: 60_000, rules });
+  const generated = files.filter((file) => file.category === "generated");
+  if (generated.length > 1) {
+    const contentPairs = await Promise.all(
+      generated.map(async (file) => [
+        file.path,
+        await showFile(root, scope.meta.sourceSHA, file.path),
+      ] as const),
+    );
+    files = collapseGeneratedDuplicates(files, new Map(contentPairs));
+  }
   const batches = buildBatches(files, {
     maxFiles: args.maxFiles ?? 10,
     maxTokens: args.maxTokens ?? 25_000,
@@ -253,6 +299,8 @@ export async function prepare(args: PrepareArgs): Promise<string> {
   if (args.reset) await store.resetProgress();
 
   if (scope.pullRequest) await store.writePullRequest(scope.pullRequest);
+  if (scope.policies) await store.writePolicies(scope.policies);
+  if (scope.builds) await store.writeBuilds(scope.builds);
   await store.writeThreads(scope.threads);
   await store.writeFiles(files);
   await store.writeBatches(batches);
@@ -277,7 +325,23 @@ export async function prepare(args: PrepareArgs): Promise<string> {
     scope.credentialSource,
     args.reset ? 0 : carried,
     rules.sources,
+    scope.policies,
+    scope.builds,
   );
+}
+
+function evidenceSummary(
+  evidence: OptionalEvidence<{ status?: string; state?: string }> | undefined,
+): string {
+  if (!evidence) return "not applicable";
+  if (!evidence.available) return `unavailable (${evidence.error ?? "request failed"})`;
+  if (evidence.items.length === 0) return "none reported";
+  const counts = new Map<string, number>();
+  for (const item of evidence.items) {
+    const state = (item.status ?? item.state ?? "unknown").toLowerCase();
+    counts.set(state, (counts.get(state) ?? 0) + 1);
+  }
+  return [...counts].map(([state, count]) => `${state} x${count}`).join(", ");
 }
 
 function formatSummary(
@@ -288,6 +352,8 @@ function formatSummary(
   credSource: string,
   carried: number,
   ruleSources: string[],
+  policies?: OptionalEvidence<PolicyEvaluation>,
+  builds?: OptionalEvidence<PullRequestStatus>,
 ): string {
   const counts = { review: 0, "stat-only": 0, skip: 0 } as Record<string, number>;
   for (const f of files) counts[f.decision]++;
@@ -324,6 +390,10 @@ function formatSummary(
   }
   if (ruleSources.length > 0) {
     lines.push(`  rules: ${ruleSources.join(", ")}`);
+  }
+  if (meta.scope === "ado-pr") {
+    lines.push(`  policies: ${evidenceSummary(policies)}`);
+    lines.push(`  PR statuses/builds: ${evidenceSummary(builds)}`);
   }
 
   lines.push("");

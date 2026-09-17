@@ -10,6 +10,7 @@ import type {
   Finding,
   ReviewThread,
   RunMeta,
+  ValidationRecord,
 } from "../types.ts";
 
 /** Cache root for run state. Never written inside the repository under review. */
@@ -54,8 +55,9 @@ export function runDirFor(meta: {
  * Commands after `prepare` take no target argument, so the run has to be
  * inferred. Inferring it from time alone is not enough: preparing a second
  * review in another repository would silently redirect every later command at
- * that one. Runs rooted in the current repository are therefore preferred, and
- * only when none exist does the most recent run anywhere win.
+ * that one. A matching repository is therefore mandatory; callers outside a
+ * prepared repository must pass `--dir` explicitly. There is deliberately no
+ * global-most-recent fallback.
  */
 export async function findLatestRun(cwd?: string): Promise<string> {
   const root = cacheRoot();
@@ -85,10 +87,21 @@ export async function findLatestRun(cwd?: string): Promise<string> {
     throw new Error("No prepared run found. Run `prr prepare <pr>` first.");
   }
 
-  const local = here ? candidates.filter((c) => c.repoRoot === here) : [];
-  const pool = local.length > 0 ? local : candidates;
-  pool.sort((a, b) => b.at - a.at);
-  return pool[0].dir;
+  if (!here) {
+    throw new Error(
+      "Cannot infer a review run outside a git repository. Pass --dir <run-directory> explicitly.",
+    );
+  }
+
+  const local = candidates.filter((c) => c.repoRoot === here);
+  if (local.length === 0) {
+    throw new Error(
+      `No prepared run matches the current repository (${here}). ` +
+        "Run `prr prepare` here, or pass --dir <run-directory> explicitly.",
+    );
+  }
+  local.sort((a, b) => b.at - a.at);
+  return local[0].dir;
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
@@ -148,6 +161,14 @@ export class RunStore {
     return writeJson(this.path("threads.json"), threads);
   }
 
+  writePolicies(value: unknown): Promise<void> {
+    return writeJson(this.path("policies.json"), value);
+  }
+
+  writeBuilds(value: unknown): Promise<void> {
+    return writeJson(this.path("builds.json"), value);
+  }
+
   readThreads(): Promise<ReviewThread[]> {
     return readJson<ReviewThread[]>(this.path("threads.json"), []);
   }
@@ -174,6 +195,14 @@ export class RunStore {
 
   readVerdicts(): Promise<FileVerdict[]> {
     return readJsonl<FileVerdict>(this.path("verdicts.jsonl"));
+  }
+
+  async appendValidation(record: ValidationRecord): Promise<void> {
+    await appendFile(this.path("validations.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+  }
+
+  readValidations(): Promise<ValidationRecord[]> {
+    return readJsonl<ValidationRecord>(this.path("validations.jsonl"));
   }
 
   async appendVerdicts(verdicts: FileVerdict[]): Promise<void> {

@@ -343,24 +343,18 @@ Each item is a confirmed friction point, ranked by the damage it can cause.
 
 ### 10.2 Medium value
 
-4. **Wrong-run protection for cross-repo sessions.** `findLatestRun` now prefers the run matching
-   the current repo root, but a command issued from an unrelated directory still silently falls
-   back to “most recent run anywhere”. In a session that reviewed two PRs in two repos, one `note`
-   call landed on the wrong run and was only caught by path validation. Make the fallback an error
-   (`--dir` required when no run matches the cwd), and print the run identity (`repo · PR · SHA`)
-   at the top of every command output.
-5. **Bulk verdicts for reviewed batches.** Recording per-file verdicts for a 10-file clean batch
-   requires the agent to hand-build JSON naming every path. Add
-   `prr note --batch <n> --all-clean` (with explicit exceptions) so a clean batch is one command
-   and a typo cannot mark the wrong file.
-6. **Generated-file pairs waste payload budget.** Multi-target generated clients (e.g. `net8.0` and
-   `net10.0` copies of the same `.g.cs`) are near-identical, but each pair costs its full token
-   weight and appears twice in batches. Detect duplicate-content groups at triage, review one
-   representative, and record the twins as `stat-only` with reason `duplicate-of:<path>`.
-7. **CI verdicts are invisible.** The run knows nothing about build/test status of the PR. When the
-   local environment lacks the toolchain (`dotnet`, etc.), the review's “validation gap” note is
-   the only signal. Fetch the PR's policy/build status from the ADO API into `pr.json` so the
-   Summary can state “CI green/red at iteration N” instead of guessing.
+4. ✅ **Wrong-run protection (implemented in v0.3.0).** Commands without `--dir` now require a
+   prepared run whose `repoRoot` matches the current git repository. Running elsewhere is a hard
+   error; there is no global-most-recent fallback.
+5. ✅ **Bulk batch verdicts (implemented in v0.3.0).**
+   `prr note --batch <n> --all-clean [--except <path>=findings|cross-batch]` records the entire
+   batch, is idempotent, validates exception paths, and refuses to overwrite a different verdict.
+6. ✅ **Generated-file deduplication (implemented in v0.3.0).** `.g.cs` files are classified as
+   generated; target-framework conditionals are normalized and duplicate content is grouped. One
+   representative is promoted to review and twins record `duplicate-of:<path>`.
+7. ✅ **ADO policy/status evidence (implemented in v0.3.0).** `prepare` fetches pull-request statuses
+   and policy evaluations opportunistically, writes `builds.json` and `policies.json`, and summarizes
+   states without failing the review when the optional endpoint is unavailable.
 
 ### 10.3 Lower value / watch list
 
@@ -371,10 +365,10 @@ Each item is a confirmed friction point, ranked by the damage it can cause.
    “thread marked fixed — is it actually fixed at this revision?” is manual. A helper that maps a
    thread's anchor onto the current diff (moved/deleted/unchanged) would make the reconciliation
    step mechanical.
-10. **Test-run integration.** Several findings were confirmed or refuted fastest by running the
-    repository's own test suite. That is host-environment-specific today; a light
-    `prr exec --record` wrapper that captures command + exit code into the run directory would let
-    the Summary cite executed validation instead of prose claims.
+10. ✅ **Test-run integration (implemented in v0.3.0).**
+    `prr exec --record --timeout <seconds> -- <command> [args...]` runs an argv vector without a
+    shell, propagates the exit code, redacts common credentials, caps output, and appends the result
+    to `validations.jsonl` for auditable Summary evidence.
 
 ## 11. Maintenance policy
 

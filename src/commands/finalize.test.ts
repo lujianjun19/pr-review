@@ -227,3 +227,47 @@ test("finalize downgrades a persisted dependency claim that lacks verification",
   const stored = JSON.parse((await readFile(join(dir, "findings.jsonl"), "utf8")).trim());
   assert.equal(stored.status, "unverified");
 });
+
+test("coverage ignores stale verdicts for files no longer reviewable", async (t) => {
+  const { dir, cleanup } = await buildRun();
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.appendVerdicts([
+    { path: "old-generated.g.cs", batch: 9, verdict: "clean", at: new Date().toISOString() },
+  ]);
+  const result = await finalize({ dir });
+  assert.match(result.output, /coverage: 1\/1 reviewable files/);
+  assert.doesNotMatch(result.output, /2\/1/);
+});
+
+test("finalize summarizes recorded validation commands", async (t) => {
+  const { dir, cleanup } = await buildRun();
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.appendValidation({
+    command: ["npm", "test"],
+    cwd: "/tmp/repo",
+    sourceSHA: "a".repeat(40),
+    startedAt: new Date().toISOString(),
+    durationMs: 100,
+    exitCode: 0,
+    timedOut: false,
+    stdout: "ok",
+    stderr: "",
+  });
+  await store.appendValidation({
+    command: ["npm", "run", "typecheck"],
+    cwd: "/tmp/repo",
+    sourceSHA: "a".repeat(40),
+    startedAt: new Date().toISOString(),
+    durationMs: 50,
+    exitCode: 2,
+    timedOut: false,
+    stdout: "",
+    stderr: "type error",
+  });
+
+  const result = await finalize({ dir });
+  assert.match(result.output, /validations: 2 recorded · 1 passed · 1 failed/);
+  assert.match(result.output, /exit 2: npm run typecheck/);
+});

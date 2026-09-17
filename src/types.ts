@@ -80,6 +80,7 @@ export interface RunMeta {
   /** Azure DevOps coordinates. Absent for local scopes. */
   org?: string;
   project?: string;
+  projectId?: string;
   repo: string;
   repoId?: string;
   prId?: number;
@@ -169,6 +170,18 @@ export interface FileVerdict {
   verdict: VerdictValue;
   note?: string;
   at: string;
+}
+
+export interface ValidationRecord {
+  command: string[];
+  cwd: string;
+  sourceSHA: string;
+  startedAt: string;
+  durationMs: number;
+  exitCode: number;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
 }
 
 /** Payload accepted by `prr note --file`. */

@@ -83,6 +83,7 @@ export async function finalize(args: FinalizeArgs): Promise<{ output: string; ok
   const threads = await store.readThreads();
   const findings = await store.readFindings();
   const verdicts = await store.readVerdicts();
+  const validations = await store.readValidations();
 
   const reviewable = files.filter((f) => f.decision === "review");
   const reviewablePaths = reviewable.map((f) => f.path);
@@ -163,8 +164,12 @@ export async function finalize(args: FinalizeArgs): Promise<{ output: string; ok
 
   const lastVerdict = new Map<string, string>();
   for (const v of verdicts) lastVerdict.set(v.path, v.verdict);
+  const reviewableSet = new Set(reviewablePaths);
+  const covered = reviewablePaths.filter((path) => lastVerdict.has(path)).length;
   const missing = reviewablePaths.filter((p) => !lastVerdict.has(p));
-  const crossBatch = [...lastVerdict].filter(([, v]) => v === "cross-batch").map(([p]) => p);
+  const crossBatch = [...lastVerdict]
+    .filter(([path, verdict]) => reviewableSet.has(path) && verdict === "cross-batch")
+    .map(([path]) => path);
 
   const publishable = verified.filter((f) => f.status === "verified");
   const blocked = verified.filter(
@@ -188,7 +193,15 @@ export async function finalize(args: FinalizeArgs): Promise<{ output: string; ok
       `${verified.filter((f) => f.status === "duplicate").length} marked duplicate, ` +
       `${verified.filter((f) => f.status === "retracted").length} retracted`,
   );
-  lines.push(`coverage: ${lastVerdict.size}/${reviewablePaths.length} reviewable files`);
+  lines.push(`coverage: ${covered}/${reviewablePaths.length} reviewable files`);
+  if (validations.length > 0) {
+    const passed = validations.filter((record) => record.exitCode === 0).length;
+    const failed = validations.length - passed;
+    lines.push(`validations: ${validations.length} recorded · ${passed} passed · ${failed} failed`);
+    for (const record of validations.filter((item) => item.exitCode !== 0).slice(0, 5)) {
+      lines.push(`  exit ${record.exitCode}: ${record.command.join(" ")}`);
+    }
+  }
   if (notes.length > 0) {
     lines.push("verification notes:");
     lines.push(...notes.slice(0, 15));

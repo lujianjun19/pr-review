@@ -110,6 +110,81 @@ export interface NoteArgs {
   dir?: string;
 }
 
+export interface NoteBatchArgs {
+  batch: number;
+  allClean: boolean;
+  /** Explicit non-clean verdicts keyed by path. */
+  exceptions: Map<string, VerdictValue>;
+  dir?: string;
+}
+
+/**
+ * Records a whole batch without forcing the agent to copy every path into JSON.
+ *
+ * Existing non-clean verdicts are never overwritten by an all-clean operation:
+ * that would silently erase review state. Re-running the same verdict is a
+ * no-op, so interrupted sessions can resume safely.
+ */
+export async function noteBatch(args: NoteBatchArgs): Promise<string> {
+  if (!args.allClean) {
+    throw new Error("Batch recording currently requires --all-clean.");
+  }
+  const store = await RunStore.open(args.dir);
+  const batches = await store.readBatches();
+  const batch = batches.find((candidate) => candidate.id === args.batch);
+  if (!batch) {
+    throw new Error(
+      `Batch ${args.batch} not found; available: ${batches.map((b) => b.id).join(", ") || "none"}.`,
+    );
+  }
+
+  for (const [path, verdict] of args.exceptions) {
+    if (!batch.files.includes(path)) {
+      throw new Error(`--except path "${path}" is not in batch ${args.batch}.`);
+    }
+    if (!VERDICTS.includes(verdict)) {
+      throw new Error(`--except verdict must be one of ${VERDICTS.join(", ")}.`);
+    }
+  }
+
+  const existing = await store.readVerdicts();
+  const latest = new Map(existing.map((entry) => [entry.path, entry.verdict]));
+  const now = new Date().toISOString();
+  const additions: FileVerdict[] = [];
+  let unchanged = 0;
+
+  for (const path of batch.files) {
+    const requested = args.exceptions.get(path) ?? "clean";
+    const current = latest.get(path);
+    if (current !== undefined) {
+      if (current !== requested) {
+        throw new Error(
+          `Refusing to change ${path} from "${current}" to "${requested}". ` +
+            "Record the correction explicitly with `prr note --file`.",
+        );
+      }
+      unchanged++;
+      continue;
+    }
+    additions.push({
+      path,
+      batch: batch.id,
+      verdict: requested,
+      at: now,
+    });
+  }
+
+  await store.appendVerdicts(additions);
+  const meta = await store.meta();
+  return [
+    `${meta.scope === "ado-pr" ? `PR ${meta.prId}` : meta.scope} · ${meta.sourceSHA.slice(0, 10)}`,
+    `batch ${batch.id}: recorded ${additions.length} verdict(s), ${unchanged} already identical`,
+    `  clean ${additions.filter((v) => v.verdict === "clean").length}, ` +
+      `findings ${additions.filter((v) => v.verdict === "findings").length}, ` +
+      `cross-batch ${additions.filter((v) => v.verdict === "cross-batch").length}`,
+  ].join("\n");
+}
+
 /**
  * Records verdicts and candidate findings from a JSON file.
  *
@@ -198,6 +273,7 @@ export async function note(args: NoteArgs): Promise<string> {
     lines.push(`  severities: ${[...bySeverity].map(([s, n]) => `${s} x${n}`).join(", ")}`);
   }
   const done = new Set((await store.readVerdicts()).map((v) => v.path));
-  lines.push(`coverage: ${done.size}/${reviewable.size} reviewable files have a verdict`);
+  const covered = [...reviewable].filter((path) => done.has(path)).length;
+  lines.push(`coverage: ${covered}/${reviewable.size} reviewable files have a verdict`);
   return lines.join("\n");
 }

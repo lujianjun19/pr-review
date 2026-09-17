@@ -22,8 +22,8 @@ Only the pull request scope can post comments; the others end at the report.
 
 | Step | Command | Guarantee |
 |---|---|---|
-| Pin and triage | `prr prepare` | Iteration SHAs come from the Azure DevOps API, not from branch names. Every changed file gets a decision and a reason. |
-| Batch | (part of `prepare`) | Risk-ordered batches; an implementation and its tests land together; hard file and token caps. |
+| Pin and triage | `prr prepare` | Iteration SHAs come from the Azure DevOps API, not from branch names. Every changed file gets a decision and a reason; PR policies/statuses are captured when available. |
+| Batch | (part of `prepare`) | Risk-ordered batches; an implementation and its tests land together; duplicate multi-target generated outputs collapse to one representative; hard file and token caps. |
 | Read | `payload/bNN.md` | Every diff line is labelled with its real line number in the source revision. |
 | Look further | `prr context`, `prr grep` | Reads and searches the reviewed revision, which works even when the repository has no checkout. Both are capped. |
 | Verify | `prr finalize` | A finding whose evidence is not in the source revision is rejected. Lines are resolved from the evidence. Coverage is enforced. |
@@ -71,6 +71,8 @@ node bin/prr.mjs grep createOrder --files-only
 node bin/prr.mjs context --path src/pay/charge.ts --start 40
 node bin/prr.mjs rules check src/pay/charge.ts
 node bin/prr.mjs note --file findings.json
+node bin/prr.mjs note --batch 2 --all-clean --except src/app.ts=findings
+node bin/prr.mjs exec --record --timeout 300 -- npm test
 node bin/prr.mjs finalize
 node bin/prr.mjs finalize --format sarif > findings.sarif
 node bin/prr.mjs post --dry-run
@@ -79,7 +81,9 @@ node bin/prr.mjs post --update-summary --summary corrected.md --dry-run
 ```
 
 Run state lives in `~/.cache/pr-review/<key>/`, never inside the repository. Commands after
-`prepare` prefer the run belonging to the repository you are standing in.
+`prepare` require a run belonging to the current repository; use `--dir` explicitly outside it.
+Optional Azure DevOps evidence is stored in `policies.json` and `builds.json`; recorded validation
+commands are stored in `validations.jsonl`.
 
 ## Project rules
 

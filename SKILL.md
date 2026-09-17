@@ -52,13 +52,21 @@ For a pull request, add `--since <iteration>` when re-reviewing one you have rev
 changes since that iteration are then in scope. Add `--reset` to discard an earlier pass over the same
 revision.
 
-The summary tells you the batch list, the pinned revisions, the rule files in effect, and every file
-that will **not** be reviewed with the reason. Those exclusions must appear in your final Summary.
+The summary tells you the batch list, pinned revisions, rule files, Azure DevOps policy/PR-status
+signals, and every file that will **not** be reviewed with the reason. `policies.json` and
+`builds.json` retain the bounded API evidence; an unavailable endpoint is a validation gap, not a
+prepare failure. Those exclusions and gaps must appear in your final Summary.
+
+Commands after `prepare` only infer a run that belongs to the current git repository. Outside that
+repository — or when several repos are in play — pass `--dir <run-directory>` explicitly; the tool
+never falls back to another repository's most recent run.
 
 ### 2. Review each batch, highest risk first
 
 Read `payload/bNN.md` from the run directory. It contains everything you need: the annotated diffs,
 per-file metadata, any project rules that apply to those paths, and existing threads on those files.
+Duplicate generated outputs (for example equivalent multi-target `.g.cs` files) are collapsed: one
+representative is reviewed and the twins appear as `stat-only` with a `duplicate-of:<path>` reason.
 
 **Line numbers in the payload are real.** The number left of each line is its line number in the
 source revision — report it as-is, never count lines yourself. Lines marked `-|` were removed and
@@ -131,8 +139,17 @@ node "<skill>/bin/prr.mjs" note --file <path.json>
 - `verdict` is `clean`, `findings`, or `cross-batch` — the last only when confirming the issue needs
   a file from a later batch. Every reviewable file needs a verdict eventually.
 
-Every reviewed file gets a verdict. Batching limits how much you read at once; it never reduces
-coverage. Defer a file only with the user's explicit approval, and list it in the Summary.
+Every reviewed file gets a verdict. For a clean batch, use the deterministic bulk command instead of
+copying every path into JSON:
+
+```
+node "<skill>/bin/prr.mjs" note --batch <n> --all-clean
+node "<skill>/bin/prr.mjs" note --batch <n> --all-clean --except <path>=findings
+```
+
+The command refuses to overwrite an existing different verdict. Batching limits how much you read
+at once; it never reduces coverage. Defer a file only with the user's explicit approval, and list it
+in the Summary.
 
 If independent subagents are available, dispatch batches in parallel: give each one its payload path,
 `reference/standards.md`, and the JSON contract above. Validate their findings yourself before
@@ -188,6 +205,16 @@ node "<skill>/bin/prr.mjs" post --update-summary --summary <corrected.md>
 ```
 
 A wrong finding left active misleads the author more than no finding.
+
+Record executable validation through the run when a narrow test/build is needed:
+
+```
+node "<skill>/bin/prr.mjs" exec --record --timeout 300 -- npm test
+```
+
+This runs an explicit argv vector without a shell and writes a redacted, capped record to
+`validations.jsonl`. A non-zero command returns the same exit code. Never claim a command passed
+unless its recorded exit code is zero.
 
 `finalize --render` prints the findings block for your report. `finalize --format sarif` emits SARIF
 2.1.0 and `--format json` the raw findings, for a pipeline that consumes them.
