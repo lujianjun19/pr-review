@@ -114,6 +114,10 @@ node "<skill>/bin/prr.mjs" note --file <path.json>
 
 - `evidence` must be copied **verbatim** from the source revision. It is what anchors the finding;
   step 4 rejects anything that is not there, and you do not need to supply a line number.
+- A claim that a dependency's API “does not exist”, “is invalid”, or “always throws” needs stronger
+  proof than any text search: verify it at runtime (`node -e "console.log(typeof x.y)"`) or by
+  running the project's own tests before recording it. Grep over vendored or built code proves
+  nothing about an API surface.
 - `verdict` is `clean`, `findings`, or `cross-batch` — the last only when confirming the issue needs
   a file from a later batch. Every reviewable file needs a verdict eventually.
 
@@ -142,6 +146,24 @@ Act on what it reports:
   move the item to **Open Questions**. Never publish it as a finding.
 - Possible duplicate — decide using the rule below. If it is a duplicate, re-record the finding with
   `"status": "duplicate"` and mention it in the Summary instead.
+
+### Retracting a wrong finding
+
+Evidence verification proves the quoted code exists; it cannot prove your claim about that code is
+true. If you discover a recorded finding is wrong — at any point, including after posting — retract
+it; do not leave it standing or silently edit it:
+
+```json
+{ "retract": ["<finding-id>"] }
+```
+
+```
+node "<skill>/bin/prr.mjs" note --file <retract.json>
+```
+
+`retracted` is terminal: `finalize` will not re-verify it and `post` will never publish it. If the
+finding was already posted, tell the user and, with their approval, reply to the posted thread with
+a correction and close it — a wrong finding left active misleads the author more than no finding.
 
 `finalize --render` prints the findings block for your report. `finalize --format sarif` emits SARIF
 2.1.0 and `--format json` the raw findings, for a pipeline that consumes them.
@@ -246,6 +268,7 @@ explicit approval.
 
 - Do not count diff lines yourself, or report a line number the payload did not give you.
 - Do not search with shell `grep`/`rg`; there may be no checkout to search. Use `prr grep`.
+- Do not claim a dependency API is missing or broken from a text search; verify at runtime first.
 - Do not report a finding whose evidence `finalize` could not verify.
 - Do not duplicate an existing thread, comment on style, or fabricate a fix.
 - Do not read a whole file when the payload already answers the question.

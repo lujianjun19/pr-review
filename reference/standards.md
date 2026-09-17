@@ -64,6 +64,21 @@ Report only measurable regressions, not speculative ones.
 - Synchronous I/O in an async context.
 - Repeated expensive work per render or per request that was previously memoized.
 
+## Claims about dependencies
+
+A finding that asserts something about a third-party library — “this method does not exist”, “this
+overload always throws”, “this option is ignored” — carries a different burden of proof than a
+finding about the changed code itself:
+
+- Text search over vendored, bundled, or minified code is **not** evidence of an API surface;
+  formatting, build output shape, and re-exports all defeat it.
+- Verify at runtime: `node -e "console.log(typeof require('lib').Thing.prototype.method)"`, a REPL
+  probe, or the library's published type declarations.
+- Strongest proof: run the repository's own tests that exercise the code path. A passing test that
+  calls the API refutes “does not exist” conclusively.
+- If runtime verification is unavailable in the environment, the claim belongs in **Open
+  Questions**, not in Findings.
+
 ## Language-specific traps worth a second look
 
 - **TypeScript/JavaScript** — `==` versus `===`; `typeof x === "number"` accepting `NaN`; `Array.sort`

@@ -322,7 +322,67 @@ The validation numbers in this document are design targets and fixture results, 
 review recall or model quality. Any benchmark result should be recorded separately with its model,
 provider, corpus, and reproducible command.
 
-## 10. Maintenance policy
+## 10. Field-review backlog
+
+Lessons from running the skill on several real multi-batch pull requests (identifiers anonymized).
+Each item is a confirmed friction point, ranked by the damage it can cause.
+
+### 10.1 Highest value
+
+1. **Dependency-claim verification gate.** The one serious failure so far was a retracted pair of
+   High findings that claimed a third-party API method did not exist, based on a text grep over a
+   minified vendor bundle. Textual search over `node_modules` (or any built artifact) is not
+   evidence about an API surface. Add to `reference/standards.md` and the finding contract: a claim
+   of the form “X does not exist / is not valid / always throws” about a dependency must be backed
+   by runtime introspection (`typeof obj.method`, a REPL probe) or an actual test run — never by
+   grep alone. Consider a `verification` field on findings so `finalize` can require one for this
+   claim class.
+2. **Retraction workflow is implemented but undocumented in `SKILL.md`.** `prr note --file` accepts
+   `{"retract": [ids]}` and `finalize` treats `retracted` as terminal, but the skill text never
+   tells the agent this path exists, nor what to do on the PR side (reply with a correction, close
+   the thread — both currently require raw REST calls). Document the retract flow and add
+   `prr post --retract <id>` that replies to and closes the posted thread in one gated step.
+3. **Summary comment goes stale after findings change.** After a retraction (or a new finding in a
+   later round), the previously posted top-level Summary still shows the old counts. Add
+   `prr post --update-summary`: re-render the summary and append a correction reply to the recorded
+   `__summary__` thread instead of leaving stale numbers as the first thing a reviewer reads.
+
+### 10.2 Medium value
+
+4. **Wrong-run protection for cross-repo sessions.** `findLatestRun` now prefers the run matching
+   the current repo root, but a command issued from an unrelated directory still silently falls
+   back to “most recent run anywhere”. In a session that reviewed two PRs in two repos, one `note`
+   call landed on the wrong run and was only caught by path validation. Make the fallback an error
+   (`--dir` required when no run matches the cwd), and print the run identity (`repo · PR · SHA`)
+   at the top of every command output.
+5. **Bulk verdicts for reviewed batches.** Recording per-file verdicts for a 10-file clean batch
+   requires the agent to hand-build JSON naming every path. Add
+   `prr note --batch <n> --all-clean` (with explicit exceptions) so a clean batch is one command
+   and a typo cannot mark the wrong file.
+6. **Generated-file pairs waste payload budget.** Multi-target generated clients (e.g. `net8.0` and
+   `net10.0` copies of the same `.g.cs`) are near-identical, but each pair costs its full token
+   weight and appears twice in batches. Detect duplicate-content groups at triage, review one
+   representative, and record the twins as `stat-only` with reason `duplicate-of:<path>`.
+7. **CI verdicts are invisible.** The run knows nothing about build/test status of the PR. When the
+   local environment lacks the toolchain (`dotnet`, etc.), the review's “validation gap” note is
+   the only signal. Fetch the PR's policy/build status from the ADO API into `pr.json` so the
+   Summary can state “CI green/red at iteration N” instead of guessing.
+
+### 10.3 Lower value / watch list
+
+8. **`prr grep` output for definition-hunting.** Finding a symbol's definition still takes 2–3 grep
+   calls (declaration vs. call sites). A `--context <n>` flag printing a few lines around each hit
+   would cut most follow-up `prr context` calls.
+9. **Thread reconciliation for `fixed` threads.** The payload lists existing threads, but verifying
+   “thread marked fixed — is it actually fixed at this revision?” is manual. A helper that maps a
+   thread's anchor onto the current diff (moved/deleted/unchanged) would make the reconciliation
+   step mechanical.
+10. **Test-run integration.** Several findings were confirmed or refuted fastest by running the
+    repository's own test suite. That is host-environment-specific today; a light
+    `prr exec --record` wrapper that captures command + exit code into the run directory would let
+    the Summary cite executed validation instead of prose claims.
+
+## 11. Maintenance policy
 
 Keep this plan architectural and repository-agnostic. Do not record private pull request URLs,
 organization names, repository names, customer names, local filesystem paths, tokens, or credentials
