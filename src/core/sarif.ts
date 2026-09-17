@@ -47,6 +47,7 @@ export function renderSarif(findings: Finding[], meta: RunMeta): string {
       severity: finding.severity,
       "security-severity": SEVERITY_SCORE[finding.severity],
       fingerprint: finding.id,
+      ...(finding.verification ? { verification: finding.verification } : {}),
     },
     partialFingerprints: { prReviewFindingId: finding.id },
     locations: [

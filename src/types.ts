@@ -117,6 +117,28 @@ export type FindingStatus =
    * the evidence text resolves. Terminal: verify must never overturn it. */
   | "retracted";
 
+/**
+ * How a claim about a dependency's API surface was checked.
+ *
+ * A grep over vendored, bundled, or minified code proves nothing about an API:
+ * formatting, re-exports and build output all defeat it. Claims of the form
+ * "this method does not exist" therefore carry a heavier burden of proof than
+ * claims about the changed code itself, which `evidence` already anchors.
+ */
+export type VerificationMethod =
+  /** Runtime introspection, e.g. `typeof client.method`. */
+  | "runtime"
+  /** The repository's own tests exercised the path. */
+  | "test-run"
+  /** Published type declarations or official API documentation. */
+  | "declaration";
+
+export interface FindingVerification {
+  method: VerificationMethod;
+  /** The command run or the source consulted. */
+  detail: string;
+}
+
 /** One review finding. Free-form prose is confined to problem/fix. */
 export interface Finding {
   id: string;
@@ -131,6 +153,8 @@ export interface Finding {
   fix: string;
   fixedCode?: string;
   status: FindingStatus;
+  /** Required when the finding asserts something about a dependency's API. */
+  verification?: FindingVerification;
   /** Existing thread id when this finding duplicates one. */
   dupOfThread?: number;
   batch?: number;

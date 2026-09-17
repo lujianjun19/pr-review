@@ -329,23 +329,17 @@ Each item is a confirmed friction point, ranked by the damage it can cause.
 
 ### 10.1 Highest value
 
-1. **Dependency-claim verification gate.** The one serious failure so far was a retracted pair of
-   High findings that claimed a third-party API method did not exist, based on a text grep over a
-   minified vendor bundle. Textual search over `node_modules` (or any built artifact) is not
-   evidence about an API surface. Add to `reference/standards.md` and the finding contract: a claim
-   of the form “X does not exist / is not valid / always throws” about a dependency must be backed
-   by runtime introspection (`typeof obj.method`, a REPL probe) or an actual test run — never by
-   grep alone. Consider a `verification` field on findings so `finalize` can require one for this
-   claim class.
-2. **Retraction workflow is implemented but undocumented in `SKILL.md`.** `prr note --file` accepts
-   `{"retract": [ids]}` and `finalize` treats `retracted` as terminal, but the skill text never
-   tells the agent this path exists, nor what to do on the PR side (reply with a correction, close
-   the thread — both currently require raw REST calls). Document the retract flow and add
-   `prr post --retract <id>` that replies to and closes the posted thread in one gated step.
-3. **Summary comment goes stale after findings change.** After a retraction (or a new finding in a
-   later round), the previously posted top-level Summary still shows the old counts. Add
-   `prr post --update-summary`: re-render the summary and append a correction reply to the recorded
-   `__summary__` thread instead of leaving stale numbers as the first thing a reviewer reads.
+1. ✅ **Dependency-claim verification gate (implemented in v0.2.0).** Findings can carry a
+   `verification` record with method `runtime`, `test-run`, or `declaration`. `prr note` rejects
+   dependency API claims without one; `finalize` independently downgrades persisted legacy records
+   that lack it. Markdown comments and SARIF carry the verification detail.
+2. ✅ **Retraction workflow (implemented in v0.2.0).** `prr note --file` accepts
+   `{"retract": [ids]}` and `finalize` treats `retracted` as terminal. With explicit write approval,
+   `prr post --retract <id>` appends a correction to the recorded thread and closes it. The action
+   is idempotent and refuses to run until local state is retracted.
+3. ✅ **Summary correction (implemented in v0.2.0).** `prr post --update-summary --summary <file>`
+   appends corrected text to the recorded `__summary__` thread. Identical content is deduplicated by
+   hash; a missing summary thread is created rather than silently skipped.
 
 ### 10.2 Medium value
 

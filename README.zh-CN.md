@@ -44,6 +44,8 @@ node bin/prr.mjs note --file findings.json
 node bin/prr.mjs finalize
 node bin/prr.mjs finalize --format sarif > findings.sarif
 node bin/prr.mjs post --dry-run
+node bin/prr.mjs post --retract <finding-id> --dry-run
+node bin/prr.mjs post --update-summary --summary corrected.md --dry-run
 ```
 
 审查状态默认保存在用户缓存目录，不写入被审仓库：
@@ -88,6 +90,18 @@ ${XDG_CACHE_HOME:-~/.cache}/pr-review/<run-key>/
   "exclude": ["**/__fixtures__/**"]
 }
 ```
+
+## 纠错和撤回
+
+逐字证据验证只能证明代码存在，不能证明 reviewer 对代码的判断正确。Finding 被确认错误时：
+
+1. 用 `prr note --file retract.json` 把它标记为终态，其中 JSON 为
+   `{ "retract": ["finding-id"] }`。
+2. 在用户明确批准后，执行 `prr post --retract <finding-id>`；工具会幂等回复更正并关闭已发布 thread。
+3. 重新生成 Summary，执行 `prr post --update-summary --summary corrected.md`，避免顶层统计和 verdict 过期。
+
+如果 finding 声称第三方依赖的 API 不存在、无效或必然抛错，必须提供 `verification` 字段；验证方式只能是
+`runtime`、`test-run` 或 `declaration`。只有文本 grep 的 finding 会被 `prr note` 拒绝。
 
 ## 开发
 

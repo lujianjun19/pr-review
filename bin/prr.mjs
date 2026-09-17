@@ -135,6 +135,25 @@ ${body}`);
       body: JSON.stringify(body)
     });
   }
+  /**
+   * Appends a comment to an existing thread.
+   *
+   * Corrections are replies rather than edits: the original comment stays
+   * visible so a reader can see what was claimed and what it was replaced by.
+   */
+  replyToThread(prId, threadId, content) {
+    return this.request(`/pullRequests/${prId}/threads/${threadId}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ content, commentType: 1 })
+    });
+  }
+  /** Changes a thread's status, e.g. to close a retracted finding. */
+  setThreadStatus(prId, threadId, status2) {
+    return this.request(
+      `/pullRequests/${prId}/threads/${threadId}`,
+      { method: "PATCH", body: JSON.stringify({ status: status2 }) }
+    );
+  }
 };
 var COMMENT_TYPES = ["unknown", "text", "codeChange", "system"];
 var THREAD_STATUSES = [
@@ -1103,7 +1122,7 @@ var RunStore = class _RunStore {
 };
 
 // src/version.ts
-var TOOL_VERSION = "0.1.0";
+var TOOL_VERSION = "0.2.0";
 
 // src/commands/prepare.ts
 async function resolveTarget(target, cwd) {
@@ -1354,6 +1373,38 @@ function formatSummary(meta, files, batches, threadCount, credSource, carried, r
 // src/commands/note.ts
 import { readFile as readFile4 } from "node:fs/promises";
 import { createHash } from "node:crypto";
+
+// src/core/findingVerification.ts
+var VERIFICATION_METHODS = [
+  "runtime",
+  "test-run",
+  "declaration"
+];
+var DEPENDENCY_CLAIM_PATTERNS = [
+  /\b(does|do|did)\s+not\s+exist\b/i,
+  /\b(is|are|was|were)\s+not\s+(a\s+)?(real|valid|public|available)\b/i,
+  /\bno\s+such\s+(method|function|property|member|api|export)\b/i,
+  /\b(is|are)\s+not\s+(a\s+)?(method|function|property|member|export)\b/i,
+  /\bnot\s+(a\s+)?(method|function|property|member|export)\s+on\b/i,
+  /\bundefined\s+(method|function|property|member|export)\b/i,
+  /\balways\s+throws?\b/i,
+  /\bnever\s+(exists|resolves|returns|fires|runs)\b/i,
+  /\bis\s+(a\s+)?typo\s+for\b/i,
+  /\bTypeError\b/,
+  /\bis\s+not\s+a\s+function\b/i
+];
+function assertsDependencyApi(problem, fix) {
+  const text = `${problem}
+${fix}`;
+  return DEPENDENCY_CLAIM_PATTERNS.some((pattern) => pattern.test(text));
+}
+function isValidFindingVerification(verification) {
+  return Boolean(
+    verification && VERIFICATION_METHODS.includes(verification.method) && verification.detail.trim()
+  );
+}
+
+// src/commands/note.ts
 var SEVERITIES = ["critical", "high", "medium", "low"];
 var VERDICTS = ["clean", "findings", "cross-batch"];
 function fail(message) {
@@ -1362,6 +1413,20 @@ function fail(message) {
 function fingerprint(path, evidence, problem) {
   const normalized = `${path}|${evidence.replace(/\s+/g, " ").trim()}|${problem.replace(/\s+/g, " ").trim().slice(0, 120)}`;
   return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
+}
+function validateVerification(raw, where) {
+  if (raw === void 0) return void 0;
+  const method = raw.method;
+  if (!VERIFICATION_METHODS.includes(method)) {
+    fail(`${where}: "verification.method" must be one of ${VERIFICATION_METHODS.join(", ")}.`);
+  }
+  const detail = (raw.detail ?? "").trim();
+  if (!detail) {
+    fail(
+      `${where}: "verification.detail" is required \u2014 record the command you ran or the declaration you consulted.`
+    );
+  }
+  return { method, detail };
 }
 function validateFinding(raw, index, knownPaths) {
   const where = `findings[${index}]`;
@@ -1381,6 +1446,12 @@ function validateFinding(raw, index, knownPaths) {
       fail(`${where}: "${field}" is required and must be non-empty.`);
     }
   }
+  const verification = validateVerification(raw.verification, where);
+  if (assertsDependencyApi(raw.problem, raw.fix) && verification === void 0) {
+    fail(
+      `${where}: this finding asserts something about a dependency's API surface, which verbatim evidence cannot prove. Verify it at runtime (e.g. \`node -e "console.log(typeof x.y)"\`) or by running the project's tests, then add "verification": { "method": "runtime" | "test-run" | "declaration", "detail": "..." }. If you cannot verify it here, move the item to Open Questions instead.`
+    );
+  }
   return {
     id: fingerprint(path, raw.evidence, raw.problem),
     path,
@@ -1393,6 +1464,7 @@ function validateFinding(raw, index, knownPaths) {
     fix: raw.fix.trim(),
     fixedCode: raw.fixedCode,
     status: "candidate",
+    ...verification ? { verification } : {},
     batch: raw.batch,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
@@ -1563,7 +1635,8 @@ Fix: ${finding.fix}` },
     properties: {
       severity: finding.severity,
       "security-severity": SEVERITY_SCORE[finding.severity],
-      fingerprint: finding.id
+      fingerprint: finding.id,
+      ...finding.verification ? { verification: finding.verification } : {}
     },
     partialFingerprints: { prReviewFindingId: finding.id },
     locations: [
@@ -1670,6 +1743,15 @@ async function finalize(args) {
       verified.push(finding);
       continue;
     }
+    const updated = { ...finding };
+    if (assertsDependencyApi(finding.problem, finding.fix) && !isValidFindingVerification(finding.verification)) {
+      updated.status = "unverified";
+      notes.push(
+        `  ${finding.id} (${finding.path}): dependency API claim lacks runtime, test-run, or declaration verification; move it to Open Questions or add verification`
+      );
+      verified.push(updated);
+      continue;
+    }
     const result = await resolveEvidence(
       meta.repoRoot,
       meta.sourceSHA,
@@ -1677,7 +1759,6 @@ async function finalize(args) {
       finding.evidence,
       reviewablePaths
     );
-    const updated = { ...finding };
     switch (result.outcome) {
       case "resolved":
         updated.status = "verified";
@@ -1784,6 +1865,9 @@ function renderFindings(findings, threads) {
     lines.push(f.evidence.trimEnd());
     lines.push("```");
     lines.push(`Fix: ${f.fix}`);
+    if (f.verification) {
+      lines.push(`Verification (${f.verification.method}): ${f.verification.detail}`);
+    }
     if (f.fixedCode) {
       lines.push("Fixed code:");
       lines.push("```");
@@ -1802,6 +1886,7 @@ ${footer}`;
 // src/commands/post.ts
 import { readFile as readFile5, writeFile as writeFile2 } from "node:fs/promises";
 import { existsSync as existsSync3 } from "node:fs";
+import { createHash as createHash2 } from "node:crypto";
 var SEVERITY_LABEL2 = {
   critical: "\u{1F534} **Critical**",
   high: "\u{1F7E0} **High**",
@@ -1824,12 +1909,22 @@ function commentBody(finding) {
     "```",
     `**Fix** ${finding.fix}`
   ];
+  if (finding.verification) {
+    parts.push(
+      "",
+      `**Verification (${finding.verification.method})** ${finding.verification.detail}`
+    );
+  }
   if (finding.fixedCode) {
     parts.push("", "**Suggested code**", "```", finding.fixedCode.trimEnd(), "```");
   }
   return parts.join("\n");
 }
+var SUMMARY_KEY = "__summary__";
 async function post(args) {
+  if (args.retract && args.retract.length > 0 && args.updateSummary) {
+    throw new Error("--retract and --update-summary are separate write actions; run them separately.");
+  }
   const store = await RunStore.open(args.dir);
   const meta = await store.meta();
   const org = meta.org;
@@ -1845,17 +1940,43 @@ async function post(args) {
   const threshold = SEVERITY_RANK[args.minSeverity ?? "high"];
   const ledgerPath = store.path("posted.json");
   const ledger = existsSync3(ledgerPath) ? JSON.parse(await readFile5(ledgerPath, "utf8")) : {};
+  const saveLedger = () => writeFile2(ledgerPath, `${JSON.stringify(ledger, null, 2)}
+`, "utf8");
+  if (args.retract && args.retract.length > 0) {
+    return retractFindings({
+      args,
+      client: new AdoClient({ org, project, repo: meta.repo }),
+      findings,
+      ledger,
+      prId,
+      saveLedger
+    });
+  }
+  if (args.updateSummary) {
+    return updateSummary({
+      args,
+      client: new AdoClient({ org, project, repo: meta.repo }),
+      ledger,
+      prId,
+      saveLedger
+    });
+  }
   const locatable = findings.filter(
     (f) => f.status === "verified" && typeof f.line === "number"
   );
-  const notPublishable = findings.length - locatable.length;
+  const terminalExcluded = findings.filter(
+    (f) => f.status === "duplicate" || f.status === "retracted"
+  ).length;
+  const notPublishable = findings.filter(
+    (f) => f.status !== "verified" && f.status !== "duplicate" && f.status !== "retracted"
+  ).length + findings.filter((f) => f.status === "verified" && typeof f.line !== "number").length;
   const eligible = locatable.filter((f) => SEVERITY_RANK[f.severity] <= threshold);
   const belowThreshold = locatable.length - eligible.length;
   const pending = eligible.filter((f) => ledger[f.id] === void 0);
   const fileByPath = new Map(files.map((f) => [f.path, f]));
   if (args.dryRun) {
     const lines2 = [
-      `dry run: ${pending.length} thread(s) would be posted to PR ${prId} (${eligible.length - pending.length} already posted, ${belowThreshold} below --min-severity, ${notPublishable} not publishable)`
+      `dry run: ${pending.length} thread(s) would be posted to PR ${prId} (${eligible.length - pending.length} already posted, ${belowThreshold} below --min-severity, ${notPublishable} not publishable, ${terminalExcluded} duplicate/retracted)`
     ];
     for (const f of pending) {
       lines2.push(`  ${f.severity} ${f.path}:${f.line} [${f.id}]`);
@@ -1875,23 +1996,21 @@ async function post(args) {
     } catch (err) {
       failed.push(`  ${finding.path}:${finding.line} \u2014 ${err.message.slice(0, 160)}`);
     }
-    await writeFile2(ledgerPath, `${JSON.stringify(ledger, null, 2)}
-`, "utf8");
+    await saveLedger();
   }
   let summaryLine = "";
   if (args.summaryFile) {
     const content = await readFile5(args.summaryFile, "utf8");
-    const key = "__summary__";
-    if (ledger[key] !== void 0) {
-      summaryLine = `summary comment already posted as thread ${ledger[key]}`;
+    if (ledger[SUMMARY_KEY] !== void 0) {
+      summaryLine = `summary comment already posted as thread ${ledger[SUMMARY_KEY]} (use --update-summary to append a correction)`;
     } else {
       const thread = await client.createThread(prId, {
         comments: [{ content, commentType: 1 }],
         status: 1
       });
-      ledger[key] = thread.id;
-      await writeFile2(ledgerPath, `${JSON.stringify(ledger, null, 2)}
-`, "utf8");
+      ledger[SUMMARY_KEY] = thread.id;
+      ledger[`summary:${summaryHash(content)}`] = thread.id;
+      await saveLedger();
       summaryLine = `summary comment posted as thread ${thread.id}`;
     }
   }
@@ -1909,6 +2028,9 @@ async function post(args) {
   }
   if (notPublishable > 0) {
     lines.push(`${notPublishable} finding(s) were not publishable (unverified or unlocated).`);
+  }
+  if (terminalExcluded > 0) {
+    lines.push(`${terminalExcluded} finding(s) were terminally excluded (duplicate or retracted).`);
   }
   return lines.join("\n");
 }
@@ -1937,6 +2059,114 @@ async function buildThread(meta, finding, file) {
     };
   }
   return thread;
+}
+async function retractFindings(ctx) {
+  const { args, client, findings, ledger, prId, saveLedger } = ctx;
+  const byId = new Map(findings.map((f) => [f.id, f]));
+  const planned = [];
+  const skipped = [];
+  for (const id of args.retract ?? []) {
+    const finding = byId.get(id);
+    if (!finding) {
+      throw new Error(`--retract: "${id}" is not a recorded finding id.`);
+    }
+    if (finding.status !== "retracted") {
+      throw new Error(
+        `--retract: finding ${id} has status "${finding.status}". Mark it retracted first with \`prr note --file\` and {"retract": ["${id}"]}, then re-run this command.`
+      );
+    }
+    const threadId = ledger[id];
+    if (threadId === void 0) {
+      skipped.push(`  ${id} (${finding.path}) \u2014 never posted, nothing to correct`);
+      continue;
+    }
+    if (ledger[`retracted:${id}`] !== void 0) {
+      skipped.push(`  ${id} (${finding.path}) \u2014 thread ${threadId} already corrected and closed`);
+      continue;
+    }
+    planned.push({ finding, threadId });
+  }
+  if (args.dryRun) {
+    const lines2 = [
+      `dry run: ${planned.length} posted thread(s) would be corrected and closed on PR ${prId}`
+    ];
+    for (const { finding, threadId } of planned) {
+      lines2.push(`  ${finding.severity} ${finding.path}:${finding.line} -> thread ${threadId}`);
+    }
+    lines2.push(...skipped);
+    return lines2.join("\n");
+  }
+  const done = [];
+  const failed = [];
+  for (const { finding, threadId } of planned) {
+    try {
+      await client.replyToThread(prId, threadId, retractionComment(finding));
+      await client.setThreadStatus(prId, threadId, "closed");
+      ledger[`retracted:${finding.id}`] = threadId;
+      await saveLedger();
+      done.push(`  ${finding.path}:${finding.line} -> thread ${threadId} corrected and closed`);
+    } catch (err) {
+      failed.push(`  ${finding.id} \u2014 ${err.message.slice(0, 160)}`);
+    }
+  }
+  const lines = [`retracted ${done.length} posted finding(s) on PR ${prId}`];
+  lines.push(...done, ...skipped);
+  if (failed.length > 0) {
+    lines.push(`failed ${failed.length}:`);
+    lines.push(...failed);
+  }
+  if (done.length > 0) {
+    lines.push(
+      "The summary comment may now be stale. Re-render it and run `prr post --update-summary`."
+    );
+  }
+  return lines.join("\n");
+}
+function retractionComment(finding) {
+  return [
+    "\u26A0\uFE0F **Correction \u2014 this finding is incorrect, please disregard**",
+    "",
+    "The claim above did not hold up on closer verification and has been retracted by the",
+    "reviewer. No change is needed for this comment.",
+    "",
+    "Apologies for the noise."
+  ].join("\n");
+}
+async function updateSummary(ctx) {
+  const { args, client, ledger, prId, saveLedger } = ctx;
+  if (!args.summaryFile) {
+    throw new Error("--update-summary requires --summary <path.md> with the corrected text.");
+  }
+  const content = await readFile5(args.summaryFile, "utf8");
+  const contentHash = summaryHash(content);
+  const updateKey = `summary:${contentHash}`;
+  const threadId = ledger[SUMMARY_KEY];
+  if (threadId === void 0) {
+    if (args.dryRun) {
+      return `dry run: no summary thread recorded yet; the text would be posted as a new summary on PR ${prId}`;
+    }
+    const thread = await client.createThread(prId, {
+      comments: [{ content, commentType: 1 }],
+      status: 1
+    });
+    ledger[SUMMARY_KEY] = thread.id;
+    ledger[updateKey] = thread.id;
+    await saveLedger();
+    return `no existing summary thread; summary posted as thread ${thread.id}`;
+  }
+  if (ledger[updateKey] !== void 0) {
+    return `summary correction already posted to thread ${threadId} (content ${contentHash})`;
+  }
+  if (args.dryRun) {
+    return `dry run: a correction would be appended to summary thread ${threadId} on PR ${prId} (content ${contentHash})`;
+  }
+  await client.replyToThread(prId, threadId, content);
+  ledger[updateKey] = threadId;
+  await saveLedger();
+  return `summary correction appended to thread ${threadId} (content ${contentHash})`;
+}
+function summaryHash(content) {
+  return createHash2("sha256").update(content).digest("hex").slice(0, 16);
 }
 
 // src/cli.ts
@@ -2006,6 +2236,14 @@ Usage:
            [--dry-run] [--dir <run>]
       Publish verified findings as inline threads. Requires explicit user
       approval. Idempotent: a finding already posted is never posted again.
+
+  prr post --retract <id>[,<id>...] [--dry-run] [--dir <run>]
+      Append a correction to each posted finding's thread and close it. The
+      finding must already be marked retracted via "prr note --file".
+
+  prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
+      Append a corrected summary to the existing summary thread, so stale
+      counts do not stand after a retraction or a later review round.
 
   prr status [--dir <run>]
       Print the current state of the run.
@@ -2151,12 +2389,16 @@ async function main() {
       return 0;
     case "post": {
       const severity = str(flags["min-severity"]);
+      const retractFlag = flags.retract;
+      const retract = typeof retractFlag === "string" ? retractFlag.split(",").map((id) => id.trim()).filter(Boolean) : void 0;
       console.log(
         await post({
           dir: str(flags.dir),
           minSeverity: severity,
           dryRun: flags["dry-run"] === true,
-          summaryFile: str(flags.summary)
+          summaryFile: str(flags.summary),
+          ...retract && retract.length > 0 ? { retract } : {},
+          updateSummary: flags["update-summary"] === true
         })
       );
       return 0;

@@ -1,6 +1,10 @@
 import { RunStore } from "../core/store.ts";
 import { resolveEvidence } from "../core/locate.ts";
 import { renderJson, renderSarif } from "../core/sarif.ts";
+import {
+  assertsDependencyApi,
+  isValidFindingVerification,
+} from "../core/findingVerification.ts";
 import type { Finding, ReviewThread, Severity } from "../types.ts";
 
 const SEVERITY_LABEL: Record<Severity, string> = {
@@ -94,6 +98,21 @@ export async function finalize(args: FinalizeArgs): Promise<{ output: string; ok
       verified.push(finding);
       continue;
     }
+
+    const updated: Finding = { ...finding };
+    if (
+      assertsDependencyApi(finding.problem, finding.fix) &&
+      !isValidFindingVerification(finding.verification)
+    ) {
+      updated.status = "unverified";
+      notes.push(
+        `  ${finding.id} (${finding.path}): dependency API claim lacks runtime, test-run, ` +
+          `or declaration verification; move it to Open Questions or add verification`,
+      );
+      verified.push(updated);
+      continue;
+    }
+
     const result = await resolveEvidence(
       meta.repoRoot,
       meta.sourceSHA,
@@ -101,7 +120,6 @@ export async function finalize(args: FinalizeArgs): Promise<{ output: string; ok
       finding.evidence,
       reviewablePaths,
     );
-    const updated: Finding = { ...finding };
     switch (result.outcome) {
       case "resolved":
         updated.status = "verified";
@@ -232,6 +250,9 @@ export function renderFindings(findings: Finding[], threads: ReviewThread[]): st
     lines.push(f.evidence.trimEnd());
     lines.push("```");
     lines.push(`Fix: ${f.fix}`);
+    if (f.verification) {
+      lines.push(`Verification (${f.verification.method}): ${f.verification.detail}`);
+    }
     if (f.fixedCode) {
       lines.push("Fixed code:");
       lines.push("```");

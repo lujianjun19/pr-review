@@ -86,6 +86,14 @@ Usage:
       Publish verified findings as inline threads. Requires explicit user
       approval. Idempotent: a finding already posted is never posted again.
 
+  prr post --retract <id>[,<id>...] [--dry-run] [--dir <run>]
+      Append a correction to each posted finding's thread and close it. The
+      finding must already be marked retracted via "prr note --file".
+
+  prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
+      Append a corrected summary to the existing summary thread, so stale
+      counts do not stand after a retraction or a later review round.
+
   prr status [--dir <run>]
       Print the current state of the run.
 `;
@@ -267,12 +275,19 @@ async function main(): Promise<number> {
         | "medium"
         | "low"
         | undefined;
+      const retractFlag = flags.retract;
+      const retract =
+        typeof retractFlag === "string"
+          ? retractFlag.split(",").map((id) => id.trim()).filter(Boolean)
+          : undefined;
       console.log(
         await post({
           dir: str(flags.dir),
           minSeverity: severity,
           dryRun: flags["dry-run"] === true,
           summaryFile: str(flags.summary),
+          ...(retract && retract.length > 0 ? { retract } : {}),
+          updateSummary: flags["update-summary"] === true,
         }),
       );
       return 0;

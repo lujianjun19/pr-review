@@ -1,7 +1,19 @@
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { RunStore } from "../core/store.ts";
-import type { FileVerdict, Finding, NoteInput, Severity, VerdictValue } from "../types.ts";
+import {
+  assertsDependencyApi,
+  VERIFICATION_METHODS,
+} from "../core/findingVerification.ts";
+import type {
+  FileVerdict,
+  Finding,
+  FindingVerification,
+  NoteInput,
+  Severity,
+  VerdictValue,
+  VerificationMethod,
+} from "../types.ts";
 
 const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 const VERDICTS: VerdictValue[] = ["clean", "findings", "cross-batch"];
@@ -25,6 +37,25 @@ function fingerprint(path: string, evidence: string, problem: string): string {
   return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
 }
 
+function validateVerification(
+  raw: Partial<FindingVerification> | undefined,
+  where: string,
+): FindingVerification | undefined {
+  if (raw === undefined) return undefined;
+  const method = raw.method as VerificationMethod;
+  if (!VERIFICATION_METHODS.includes(method)) {
+    fail(`${where}: "verification.method" must be one of ${VERIFICATION_METHODS.join(", ")}.`);
+  }
+  const detail = (raw.detail ?? "").trim();
+  if (!detail) {
+    fail(
+      `${where}: "verification.detail" is required — record the command you ran or the ` +
+        `declaration you consulted.`,
+    );
+  }
+  return { method, detail };
+}
+
 function validateFinding(raw: Partial<Finding>, index: number, knownPaths: Set<string>): Finding {
   const where = `findings[${index}]`;
   const path = (raw.path ?? "").replace(/^\//, "");
@@ -44,6 +75,18 @@ function validateFinding(raw: Partial<Finding>, index: number, knownPaths: Set<s
       fail(`${where}: "${field}" is required and must be non-empty.`);
     }
   }
+
+  const verification = validateVerification(raw.verification, where);
+  if (assertsDependencyApi(raw.problem!, raw.fix!) && verification === undefined) {
+    fail(
+      `${where}: this finding asserts something about a dependency's API surface, which ` +
+        `verbatim evidence cannot prove. Verify it at runtime (e.g. ` +
+        `\`node -e "console.log(typeof x.y)"\`) or by running the project's tests, then add ` +
+        `"verification": { "method": "runtime" | "test-run" | "declaration", "detail": "..." }. ` +
+        `If you cannot verify it here, move the item to Open Questions instead.`,
+    );
+  }
+
   return {
     id: fingerprint(path, raw.evidence!, raw.problem!),
     path,
@@ -56,6 +99,7 @@ function validateFinding(raw: Partial<Finding>, index: number, knownPaths: Set<s
     fix: raw.fix!.trim(),
     fixedCode: raw.fixedCode,
     status: "candidate",
+    ...(verification ? { verification } : {}),
     batch: raw.batch,
     createdAt: new Date().toISOString(),
   };

@@ -110,6 +110,31 @@ export class AdoClient {
       body: JSON.stringify(body),
     });
   }
+
+  /**
+   * Appends a comment to an existing thread.
+   *
+   * Corrections are replies rather than edits: the original comment stays
+   * visible so a reader can see what was claimed and what it was replaced by.
+   */
+  replyToThread(prId: number, threadId: number, content: string): Promise<{ id: number }> {
+    return this.request<{ id: number }>(`/pullRequests/${prId}/threads/${threadId}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ content, commentType: 1 }),
+    });
+  }
+
+  /** Changes a thread's status, e.g. to close a retracted finding. */
+  setThreadStatus(
+    prId: number,
+    threadId: number,
+    status: "active" | "fixed" | "wontFix" | "closed" | "byDesign" | "pending",
+  ): Promise<{ id: number; status?: string }> {
+    return this.request<{ id: number; status?: string }>(
+      `/pullRequests/${prId}/threads/${threadId}`,
+      { method: "PATCH", body: JSON.stringify({ status }) },
+    );
+  }
 }
 
 interface RawComment {

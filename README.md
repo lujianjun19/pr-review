@@ -74,6 +74,8 @@ node bin/prr.mjs note --file findings.json
 node bin/prr.mjs finalize
 node bin/prr.mjs finalize --format sarif > findings.sarif
 node bin/prr.mjs post --dry-run
+node bin/prr.mjs post --retract <finding-id> --dry-run
+node bin/prr.mjs post --update-summary --summary corrected.md --dry-run
 ```
 
 Run state lives in `~/.cache/pr-review/<key>/`, never inside the repository. Commands after
@@ -96,6 +98,21 @@ matching glob wins; `mergeBuiltin` keeps the built-in as well.
 ```
 
 Check what applies to a file with `prr rules check <path>`.
+
+## Corrections and retractions
+
+Evidence verification proves that quoted code exists; it cannot prove that a reviewer's claim about
+it is correct. When a finding is wrong:
+
+1. Mark it terminal in local state with `prr note --file retract.json`, where the JSON is
+   `{ "retract": ["finding-id"] }`.
+2. With explicit approval, run `prr post --retract <finding-id>` to append a correction and close the
+   posted thread.
+3. Re-render the summary and run `prr post --update-summary --summary corrected.md` so its counts and
+   verdict no longer remain stale.
+
+Claims about a dependency API require a finding-level `verification` object whose method is
+`runtime`, `test-run`, or `declaration`. `prr note` rejects dependency-surface claims without it.
 
 ## Development
 

@@ -117,7 +117,17 @@ node "<skill>/bin/prr.mjs" note --file <path.json>
 - A claim that a dependency's API “does not exist”, “is invalid”, or “always throws” needs stronger
   proof than any text search: verify it at runtime (`node -e "console.log(typeof x.y)"`) or by
   running the project's own tests before recording it. Grep over vendored or built code proves
-  nothing about an API surface.
+  nothing about an API surface. Record that proof in the finding:
+
+  ```json
+  "verification": {
+    "method": "runtime",
+    "detail": "node -e \"console.log(typeof client.method)\" => function"
+  }
+  ```
+
+  Allowed methods are `runtime`, `test-run`, and `declaration`; `prr note` rejects this class of
+  finding without one.
 - `verdict` is `clean`, `findings`, or `cross-batch` — the last only when confirming the issue needs
   a file from a later batch. Every reviewable file needs a verdict eventually.
 
@@ -161,9 +171,23 @@ it; do not leave it standing or silently edit it:
 node "<skill>/bin/prr.mjs" note --file <retract.json>
 ```
 
-`retracted` is terminal: `finalize` will not re-verify it and `post` will never publish it. If the
-finding was already posted, tell the user and, with their approval, reply to the posted thread with
-a correction and close it — a wrong finding left active misleads the author more than no finding.
+`retracted` is terminal: `finalize` will not re-verify it and normal posting will never publish it.
+If it was already posted, obtain explicit approval, then use the gated write path:
+
+```
+node "<skill>/bin/prr.mjs" post --retract <finding-id> --dry-run
+node "<skill>/bin/prr.mjs" post --retract <finding-id>
+```
+
+This appends a correction and closes the recorded thread idempotently. Retraction changes finding
+counts, so render a corrected Summary and update its existing thread too:
+
+```
+node "<skill>/bin/prr.mjs" post --update-summary --summary <corrected.md> --dry-run
+node "<skill>/bin/prr.mjs" post --update-summary --summary <corrected.md>
+```
+
+A wrong finding left active misleads the author more than no finding.
 
 `finalize --render` prints the findings block for your report. `finalize --format sarif` emits SARIF
 2.1.0 and `--format json` the raw findings, for a pipeline that consumes them.
@@ -258,8 +282,9 @@ node "<skill>/bin/prr.mjs" post [--min-severity medium] [--summary <path.md>]
 ```
 
 Critical and High are posted by default; Medium and Low require the user to say so. Posting is
-idempotent — a finding already posted is never posted twice — and only verified, located,
-non-duplicate findings are eligible. Report what was posted and what was withheld.
+idempotent — a finding, retraction correction, or identical summary correction is never posted twice
+— and only verified, located, non-duplicate findings are eligible. Report what was posted and what
+was withheld.
 
 Voting, resolving threads, changing reviewers, pushing, and editing files each need their own
 explicit approval.

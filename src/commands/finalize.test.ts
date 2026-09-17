@@ -81,6 +81,10 @@ test("a retracted finding is never resurrected by finalize's evidence check", as
           problem: "qc.query is not a real method",
           evidence: "qc.query(x)",
           fix: "use fetchQuery",
+          verification: {
+            method: "runtime",
+            detail: "synthetic regression fixture: assume the claim was checked before retraction",
+          },
         },
       ],
     }),
@@ -119,4 +123,107 @@ test("note --retract rejects an unknown finding id", async (t) => {
   const retractPath = join(dir, "retract.json");
   await writeFile(retractPath, JSON.stringify({ retract: ["doesnotexist"] }), "utf8");
   await assert.rejects(() => note({ file: retractPath, dir }), /is not a recorded finding id/);
+});
+
+test("dependency API claims require runtime, test, or declaration verification", async (t) => {
+  const { dir, cleanup } = await buildRun();
+  t.after(() => cleanup());
+  const { writeFile } = await import("node:fs/promises");
+  const notePath = join(dir, "dependency-claim.json");
+  const finding = {
+    path: "f.ts",
+    severity: "high",
+    category: "bug",
+    problem: "queryClient.query does not exist on the dependency API.",
+    evidence: "qc.query(x)",
+    fix: "Use fetchQuery instead.",
+  };
+  await writeFile(notePath, JSON.stringify({ findings: [finding] }), "utf8");
+
+  await assert.rejects(
+    () => note({ file: notePath, dir }),
+    /asserts something about a dependency's API surface/,
+  );
+
+  await writeFile(
+    notePath,
+    JSON.stringify({
+      findings: [
+        {
+          ...finding,
+          verification: {
+            method: "runtime",
+            detail: "node -e \"console.log(typeof new QueryClient().query)\" => function",
+          },
+        },
+      ],
+    }),
+    "utf8",
+  );
+  await note({ file: notePath, dir });
+  const stored = JSON.parse((await readFile(join(dir, "findings.jsonl"), "utf8")).trim());
+  assert.deepEqual(stored.verification, {
+    method: "runtime",
+    detail: "node -e \"console.log(typeof new QueryClient().query)\" => function",
+  });
+
+  await finalize({ dir });
+  const rendered = await finalize({ dir, render: true });
+  assert.match(
+    rendered.output,
+    /Verification \(runtime\): node -e "console\.log\(typeof new QueryClient\(\)\.query\)" => function/,
+  );
+});
+
+test("ordinary findings do not require dependency verification", async (t) => {
+  const { dir, cleanup } = await buildRun();
+  t.after(() => cleanup());
+  const { writeFile } = await import("node:fs/promises");
+  const notePath = join(dir, "ordinary.json");
+  await writeFile(
+    notePath,
+    JSON.stringify({
+      findings: [
+        {
+          path: "f.ts",
+          severity: "medium",
+          category: "bug",
+          problem: "The condition uses the wrong value and skips valid rows.",
+          evidence: "qc.query(x)",
+          fix: "Compare the row value instead.",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  await note({ file: notePath, dir });
+  const stored = JSON.parse((await readFile(join(dir, "findings.jsonl"), "utf8")).trim());
+  assert.equal(stored.status, "candidate");
+  assert.equal(stored.verification, undefined);
+});
+
+test("finalize downgrades a persisted dependency claim that lacks verification", async (t) => {
+  const { dir, cleanup } = await buildRun();
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.appendFindings([
+    {
+      id: "legacy-record",
+      path: "f.ts",
+      severity: "high",
+      category: "bug",
+      problem: "qc.query does not exist on the dependency API.",
+      evidence: "qc.query(x)",
+      fix: "Use fetchQuery instead.",
+      status: "candidate",
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+
+  const result = await finalize({ dir });
+  assert.match(result.output, /dependency API claim lacks/);
+  assert.match(result.output, /0 verified, 1 not publishable/);
+
+  const stored = JSON.parse((await readFile(join(dir, "findings.jsonl"), "utf8")).trim());
+  assert.equal(stored.status, "unverified");
 });
