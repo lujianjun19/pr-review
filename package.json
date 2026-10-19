@@ -1,13 +1,15 @@
 {
   "name": "pr-review-skill",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Deterministic toolkit backing the pr-review agent skill (Azure DevOps).",
   "scripts": {
     "build": "esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm --outfile=bin/prr.mjs --banner:js=\"#!/usr/bin/env node\"",
-    "test": "node --test src/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "test": "node --test src/**/*.test.ts scripts/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "check:public": "node scripts/check-public-safety.mjs",
+    "precommit:check": "node scripts/check-public-safety.mjs --staged"
   },
   "devDependencies": {
     "@types/node": "^22.20.3",

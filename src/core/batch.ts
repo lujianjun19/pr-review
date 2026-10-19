@@ -1,4 +1,4 @@
-import type { Batch, ChangedFile } from "../types.ts";
+import type { Batch, ChangedFile, ReviewDepth } from "../types.ts";
 
 export interface BatchOptions {
   maxFiles: number;
@@ -15,6 +15,24 @@ export const DEFAULT_BATCH: BatchOptions = {
   planFileLines: 50,
   planGroupLines: 100,
 };
+
+/**
+ * Batch shape per review depth.
+ *
+ * Quick reads more at once and plans only for very large changes; deep reads
+ * less at once and always plans, trading round trips for attention. Explicit
+ * --max-files / --max-tokens still override the preset.
+ */
+export function batchOptionsFor(depth: ReviewDepth): BatchOptions {
+  switch (depth) {
+    case "quick":
+      return { maxFiles: 15, maxTokens: 40_000, planFileLines: 200, planGroupLines: 400 };
+    case "deep":
+      return { maxFiles: 6, maxTokens: 15_000, planFileLines: 1, planGroupLines: 1 };
+    default:
+      return { ...DEFAULT_BATCH };
+  }
+}
 
 /**
  * Minimum relatedness for a file to join an existing batch.

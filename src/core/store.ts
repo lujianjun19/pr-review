@@ -8,6 +8,8 @@ import type {
   ChangedFile,
   FileVerdict,
   Finding,
+  PriorFinding,
+  ReviewResult,
   ReviewThread,
   RunMeta,
   ValidationRecord,
@@ -167,6 +169,27 @@ export class RunStore {
 
   writeBuilds(value: unknown): Promise<void> {
     return writeJson(this.path("builds.json"), value);
+  }
+
+  /** Writes a markdown document such as intent.md or guidance.md. */
+  writeText(relative: string, content: string): Promise<void> {
+    return writeFile(this.path(relative), content, "utf8");
+  }
+
+  writePriorFindings(value: PriorFinding[]): Promise<void> {
+    return writeJson(this.path("prior-findings.json"), value);
+  }
+
+  readPriorFindings(): Promise<PriorFinding[]> {
+    return readJson<PriorFinding[]>(this.path("prior-findings.json"), []);
+  }
+
+  writeResult(value: ReviewResult): Promise<void> {
+    return writeJson(this.path("result.json"), value);
+  }
+
+  readResult(): Promise<ReviewResult | undefined> {
+    return readJson<ReviewResult | undefined>(this.path("result.json"), undefined);
   }
 
   readThreads(): Promise<ReviewThread[]> {

@@ -57,6 +57,20 @@ export interface PolicyEvaluation {
   context?: Record<string, unknown>;
 }
 
+export interface WorkItem {
+  id: number;
+  fields?: Record<string, unknown>;
+}
+
+export const WORK_ITEM_FIELDS = [
+  "System.Title",
+  "System.WorkItemType",
+  "System.State",
+  "System.Description",
+  "Microsoft.VSTS.Common.AcceptanceCriteria",
+  "Microsoft.VSTS.TCM.ReproSteps",
+];
+
 /** Thin Azure DevOps Git REST client. Native fetch only, no dependencies. */
 export class AdoClient {
   private readonly target: AdoTarget;
@@ -146,6 +160,38 @@ export class AdoClient {
       `/_apis/policy/evaluations?${query.toString()}`;
     const res = await this.requestUrl<{ value: PolicyEvaluation[] }>(url);
     return res.value ?? [];
+  }
+
+  /** Ids of the work items linked to a pull request. */
+  async listPullRequestWorkItemIds(prId: number): Promise<number[]> {
+    const res = await this.request<{ value: { id: string | number }[] }>(
+      `/pullRequests/${prId}/workitems`,
+    );
+    return (res.value ?? [])
+      .map((ref) => Number(ref.id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+  }
+
+  /**
+   * Reads the fields that state what a work item asks for.
+   *
+   * `errorPolicy=Omit` keeps one deleted or inaccessible item from failing the
+   * whole request; it comes back as null and is dropped.
+   */
+  async getWorkItems(ids: number[]): Promise<WorkItem[]> {
+    if (ids.length === 0) return [];
+    const { org, project } = this.target;
+    const query = new URLSearchParams({
+      ids: ids.join(","),
+      fields: WORK_ITEM_FIELDS.join(","),
+      errorPolicy: "Omit",
+      "api-version": API_VERSION,
+    });
+    const url =
+      `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}` +
+      `/_apis/wit/workitems?${query.toString()}`;
+    const res = await this.requestUrl<{ value: (WorkItem | null)[] }>(url);
+    return (res.value ?? []).filter((item): item is WorkItem => item !== null);
   }
 
   /** Creates a comment thread. The body is sent as JSON, so emoji survive intact. */

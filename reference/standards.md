@@ -6,6 +6,8 @@ applicable dimensions pass.
 ## Correctness
 
 - Logic against stated intent — does the code do what the title, description, and linked work item say?
+  The payload's **Stated intent** section carries them; a partial or divergent implementation is a
+  finding.
 - Boundary conditions: empty, null/undefined, zero, negative, maximum, off-by-one.
 - Inverted, short-circuited, or accidentally always-true conditions.
 - Units, currency, timezone, precision, and rounding. Float equality on money or measurements.
@@ -89,3 +91,31 @@ finding about the changed code itself:
 - **Python** — mutable default arguments; broad `except`; late-binding closures in loops.
 - **Go** — loop variable capture; ignored errors; missing `defer` on a resource; nil map writes.
 - **SQL** — implicit cross joins; `NULL` comparison semantics; missing index on a new filter column.
+
+## Introduced or pre-existing
+
+A finding belongs to this change only if the change introduced it or made it reachable. Ask: does
+the defect exist at the base revision with the same inputs?
+
+- **Introduced** — the defect is in added or modified lines, or an unchanged line now misbehaves
+  because of something the change did (a new caller, a changed contract, a removed guard). Report it
+  normally.
+- **Pre-existing** — the defect is in code the change did not touch and did not make newly
+  reachable. Record it with `"preExisting": true`; it never blocks the verdict.
+
+When unsure, it is introduced if the change is the reason a user would now hit it.
+
+## Challenging a finding
+
+The challenger's job is to break the claim, not to agree with it. Check, in order:
+
+1. **Reachability** — is the bad input or state actually possible? Look for guards, validation,
+   types, and callers upstream (`prr grep` for call sites).
+2. **Behaviour** — trace the code path with a concrete input. Does it really produce the claimed
+   result?
+3. **Intent** — is the behaviour deliberate, per the stated intent, guidance, or a code comment?
+4. **Impact** — does the severity match the consequence?
+
+Answer `refuted` when any step disproves the claim, `uncertain` when the answer depends on something
+the code does not show, and `confirmed` only after a concrete trace. Severity disagreements are not
+refutations: correct the severity with `reclassify` instead.

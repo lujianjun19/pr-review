@@ -52,10 +52,29 @@ For a pull request, add `--since <iteration>` when re-reviewing one you have rev
 changes since that iteration are then in scope. Add `--reset` to discard an earlier pass over the same
 revision.
 
+`--depth quick|standard|deep` (default `standard`) sets thoroughness. Use `deep` when the user asks
+for it or the change is security- or data-critical; `quick` only when asked for a fast pass.
+
+| Depth | Batches | Plan first | Independent challenge required for | Low findings |
+|---|---|---|---|---|
+| quick | large | very large changes only | nothing | suppressed |
+| standard | default | ≥ 50 changed lines | Critical, High, Medium | reported |
+| deep | small | always | every finding | reported |
+
 The summary tells you the batch list, pinned revisions, rule files, Azure DevOps policy/PR-status
 signals, and every file that will **not** be reviewed with the reason. `policies.json` and
 `builds.json` retain the bounded API evidence; an unavailable endpoint is a validation gap, not a
-prepare failure. Those exclusions and gaps must appear in your final Summary.
+prepare failure. Those exclusions and gaps must appear in your final Summary. It also reports:
+
+- **intent** — `intent.md` holds the title, description and linked work items (or, for a branch,
+  the commit messages). An excerpt opens every payload.
+- **guidance** — `AGENTS.md`, `CLAUDE.md`, `REVIEW.md` and Copilot instruction files that govern
+  the changed paths, collected in `guidance.md`. Read it once per review.
+- **risk tier** — a suggested number of human approvers (0, 1 or 2) with its reasons. Advisory only:
+  quote it in the Summary; never vote or assign reviewers because of it.
+- **prior prr findings** — threads posted by earlier runs, in `prior-findings.json` (see Re-review).
+- **WARNING: this change edits review configuration** — rules and guidance are always read from the
+  base revision, so the change cannot loosen its own review. Review the edit itself.
 
 Commands after `prepare` only infer a run that belongs to the current git repository. Outside that
 repository — or when several repos are in play — pass `--dir <run-directory>` explicitly; the tool
@@ -78,6 +97,17 @@ addition to the standards, and treat a violation as a finding.
 If the batch header says `plan first: yes`, list the risks worth checking before reading the diffs,
 then check them.
 
+Check each change against the **Stated intent** section: a change that does something other than
+what was asked, or only part of it, is a finding. Rules stated in repository guidance are constraints
+like project rules; style or tone guidance is never a reason to report.
+
+Existing threads are listed with their **replies**. If the author already answered a point, do not
+raise it again unless the answer is wrong — and then say why.
+
+A defect you notice in code this change did not introduce is **pre-existing**: record it with
+`"preExisting": true`. It is reported in its own section, never blocks the verdict, and is not posted
+unless the user asks.
+
 Read more only when a candidate finding cannot be confirmed from the payload:
 
 ```
@@ -99,18 +129,19 @@ Write a JSON file with your own file-writing tool, then record it. Never pipe JS
 {
   "batch": 1,
   "verdicts": [
-    { "path": "src/pay/charge.ts", "verdict": "findings" },
-    { "path": "src/pay/__tests__/charge.test.ts", "verdict": "clean" }
+    { "path": "src/api/pagination.ts", "verdict": "findings" },
+    { "path": "src/api/__tests__/pagination.test.ts", "verdict": "clean" }
   ],
   "findings": [
     {
-      "path": "src/pay/charge.ts",
+      "path": "src/api/pagination.ts",
       "severity": "high",
       "category": "bug",
-      "problem": "Refund path compares a float total for equality, so a cent of rounding leaves the order unrefunded.",
-      "evidence": "if (order.total === refund.amount) {",
-      "fix": "Compare in minor units.",
-      "fixedCode": "if (toCents(order.total) === toCents(refund.amount)) {"
+      "problem": "The last page is never returned when the item count is an exact multiple of the page size.",
+      "evidence": "for (let page = 1; page < pageCount; page++) {",
+      "fix": "Include the last page in the loop bound.",
+      "fixedCode": "for (let page = 1; page <= pageCount; page++) {",
+      "rationale": "pageCount is 1-based; with 20 items and size 10 the loop stops after page 1."
     }
   ]
 }
@@ -138,6 +169,9 @@ node "<skill>/bin/prr.mjs" note --file <path.json>
   finding without one.
 - `verdict` is `clean`, `findings`, or `cross-batch` — the last only when confirming the issue needs
   a file from a later batch. Every reviewable file needs a verdict eventually.
+- `rationale` (optional, recommended) is the reasoning chain: why the code misbehaves and how you
+  confirmed it. It is shown under "Why this was flagged" when posted.
+- `preExisting: true` marks a defect not introduced by this change.
 
 Every reviewed file gets a verdict. For a clean batch, use the deterministic bulk command instead of
 copying every path into JSON:
@@ -155,6 +189,31 @@ If independent subagents are available, dispatch batches in parallel: give each 
 `reference/standards.md`, and the JSON contract above. Validate their findings yourself before
 recording them.
 
+### 3b. Challenge every blocking finding
+
+Evidence verification proves the quoted code exists, not that the claim about it is true. Before
+finalizing, try to **refute** each finding the depth requires (see the table in step 1).
+
+Preferably dispatch a fresh subagent per finding (or per batch of findings) with: the finding, the
+payload it came from, and this instruction: *"Try to prove this finding wrong. Read the surrounding
+code with `prr context` and `prr grep`. Answer `confirmed`, `refuted` or `uncertain`, with what you
+checked."* Without subagents, re-read the code yourself with that adversarial instruction, and record
+`"by": "self"`.
+
+```json
+{ "challenges": [
+  { "id": "<finding-id>", "outcome": "confirmed", "detail": "Traced listAll() with 20 items, size 10: page 2 is skipped.", "by": "subagent" }
+] }
+```
+
+```
+node "<skill>/bin/prr.mjs" note --file <challenges.json>
+```
+
+- `refuted` retracts the finding immediately; it never reaches the author.
+- `uncertain` routes it to **Open Questions** at finalize.
+- `confirmed` keeps it; the detail is posted under "Why this was flagged".
+
 ### 4. Finalize
 
 ```
@@ -162,8 +221,10 @@ node "<skill>/bin/prr.mjs" finalize
 ```
 
 This verifies every finding's evidence against the source revision, resolves its line, re-files it if
-the evidence belongs to another changed file, checks coverage, and shortlists possible duplicates of
-existing threads. It exits non-zero while coverage is incomplete.
+the evidence belongs to another changed file, applies path thresholds and the Low cap, checks that
+every finding the depth requires has been challenged, checks coverage, and shortlists possible
+duplicates of existing threads. It writes `result.json` (counts and a suggested verdict) and exits
+non-zero while coverage or challenges are incomplete.
 
 **Do not produce a verdict until `finalize` reports OK.**
 
@@ -171,8 +232,15 @@ Act on what it reports:
 
 - Evidence not found, or unlocated — the claim is not anchored to the code. Quote the code exactly, or
   move the item to **Open Questions**. Never publish it as a finding.
-- Possible duplicate — decide using the rule below. If it is a duplicate, re-record the finding with
-  `"status": "duplicate"` and mention it in the Summary instead.
+- Possible duplicate — decide using the rule below. If it is a duplicate, record
+  `{"duplicates": [{"id": "<finding-id>", "thread": <thread-id>}]}` with `prr note --file` and
+  mention it in the Summary instead. Re-noting a finding never changes it: its id is unchanged, so
+  the second record is ignored. To correct a severity, record
+  `{"reclassify": [{"id": "<finding-id>", "severity": "medium"}]}`.
+- Unconfirmed — the challenge was uncertain. Report it under **Open Questions**, not Findings.
+- Suppressed — verified but below a path's `minSeverity`, over `maxLowFindings`, or Low in a quick
+  review. Give the count in the Summary; do not list them as findings.
+- Needs an independent challenge — go back to step 3b.
 
 ### Retracting a wrong finding
 
@@ -219,6 +287,27 @@ unless its recorded exit code is zero.
 `finalize --render` prints the findings block for your report. `finalize --format sarif` emits SARIF
 2.1.0 and `--format json` the raw findings, for a pipeline that consumes them.
 
+### Re-review: earlier prr findings
+
+Every comment `prr` posts ends with `prr finding <id>`, so a later run recognizes it.
+`prior-findings.json` lists each such thread with its status, its replies, and whether its quoted
+evidence still exists at the new revision. Payload thread lists mark them too.
+
+For each **open** prior finding:
+
+- Evidence gone, or the code visibly fixed — confirm the defect is gone, then propose resolving it.
+- Author replied with a disagreement — judge it. If the author is right, propose withdrawing it.
+- Still present and unanswered — leave it; do not post it again (posting skips it automatically).
+
+Resolving is a write. With approval:
+
+```
+node "<skill>/bin/prr.mjs" post --resolve <thread-id>[,<id>...] --dry-run
+node "<skill>/bin/prr.mjs" post --resolve <thread-id> [--resolution withdrawn] [--message reply.md]
+```
+
+`--resolve` only accepts threads listed in `prior-findings.json`; it never touches a human's thread.
+
 ### 5. Report, then stop
 
 Present Summary, Findings, Open Questions (if any), and Verdict. Then, for a pull request, ask whether
@@ -233,15 +322,27 @@ built-ins; the first entry whose glob matches a file wins.
 ```json
 {
   "rules": [
-    { "path": "src/payments/**", "rule": "Money is handled in minor units; no float arithmetic.", "mergeBuiltin": true }
+    { "path": "src/api/**", "rule": "Every endpoint validates its input at the boundary.", "mergeBuiltin": true }
   ],
   "exclude": ["**/__fixtures__/**"]
 }
 ```
 
-`prr rules check <path>` shows what applies to a file and from which layer. Suggest writing a rule
-when the same project-specific correction keeps coming up; do not create or edit the file yourself
-without being asked.
+Further keys, all optional:
+
+- `"minSeverity": "high"` on a rule — findings below it on matching paths are suppressed, for code
+  that deserves a higher bar (scripts, prototypes). A rule may set only `minSeverity`.
+- `"maxLowFindings": 5` — the most Low findings one review publishes; the rest are counted.
+- `"alwaysHuman": ["infra/**"]` — paths that always lift the risk tier to at least one human.
+- `"riskPaths": [{ "path": "src/core/**", "weight": 3, "label": "core-logic" }]` — areas the project
+  wants reviewed earlier. The toolkit is business-agnostic: built-in risk signals are technical
+  only, so business-critical areas are declared here by the project. Entries sharing a label count
+  once. Globs are case-sensitive.
+
+For a review, the project file is read from the **base revision**, so a change cannot rewrite its own
+rules. `prr rules check <path>` reads the working tree by default (`--rev <ref>` reads a revision).
+Suggest writing a rule when the same project-specific correction keeps coming up; do not create or
+edit the file yourself without being asked.
 
 ## Severity
 
@@ -255,6 +356,9 @@ without being asked.
 
 Critical, High and Medium block approval. The emoji is part of the label: always write `🟠 High`,
 never `High` or `[HIGH]`.
+
+🟣 **Pre-existing** marks a defect this change did not introduce, alongside its severity, e.g.
+`🟣 Pre-existing (High)`. It never blocks approval.
 
 Severity is not confidence. If the evidence does not confirm a defect, it belongs in **Open
 Questions**, not in a lower severity.
@@ -280,13 +384,15 @@ harmless refactors. Note meaningful positives briefly.
 
 ### Summary
 
-One paragraph: what the change does, overall risk, batch coverage, files excluded by triage and why,
-validation performed, remaining gaps, and any confirmed issue omitted because an existing thread
-already covers it.
+One paragraph: what the change does and whether it matches the stated intent, the suggested risk
+tier, batch coverage, files excluded by triage and why, validation performed, remaining gaps,
+findings suppressed by thresholds or caps (count only), any confirmed issue omitted because an
+existing thread already covers it, and the state of earlier prr findings on a re-review.
 
 ### Findings
 
 Ordered by severity, as rendered by `finalize --render`. Each finding must stand alone as a comment.
+Pre-existing issues follow in their own section.
 
 ### Open Questions (optional)
 
@@ -299,6 +405,9 @@ line, and the exact evidence needed. Do not disguise speculative findings as que
 - 🔄 **Request Changes** — one or more confirmed blocking findings
 - ❓ **Needs Clarification** — missing information prevents a responsible verdict
 
+`result.json` carries a `suggestedVerdict` computed from the recorded findings. Use it unless you have
+a stated reason to differ. Pre-existing findings never change the verdict.
+
 With no findings, say so explicitly and state any validation gaps. Never manufacture a finding.
 
 ## Posting (only after explicit approval)
@@ -308,10 +417,12 @@ node "<skill>/bin/prr.mjs" post --dry-run
 node "<skill>/bin/prr.mjs" post [--min-severity medium] [--summary <path.md>]
 ```
 
-Critical and High are posted by default; Medium and Low require the user to say so. Posting is
-idempotent — a finding, retraction correction, or identical summary correction is never posted twice
-— and only verified, located, non-duplicate findings are eligible. Report what was posted and what
-was withheld.
+Critical and High are posted by default; Medium and Low require the user to say so. Pre-existing
+findings need `--include-pre-existing`. Posting is idempotent — a finding (also one posted by an
+earlier run), retraction correction, or identical summary correction is never posted twice — and
+only verified, located, non-duplicate, non-suppressed findings are eligible. A posted summary ends
+with a generated `prr result:` line that pipelines can parse. Report what was posted and what was
+withheld.
 
 Voting, resolving threads, changing reviewers, pushing, and editing files each need their own
 explicit approval.
@@ -325,3 +436,5 @@ explicit approval.
 - Do not duplicate an existing thread, comment on style, or fabricate a fix.
 - Do not read a whole file when the payload already answers the question.
 - Do not skip `finalize`, and do not issue a verdict while it reports blockers.
+- Do not let the agent that found an issue be its only judge; challenge blocking findings.
+- Do not block a change on a pre-existing defect, or repeat a point the author already answered.

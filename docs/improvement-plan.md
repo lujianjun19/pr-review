@@ -361,16 +361,48 @@ Each item is a confirmed friction point, ranked by the damage it can cause.
 8. **`prr grep` output for definition-hunting.** Finding a symbol's definition still takes 2–3 grep
    calls (declaration vs. call sites). A `--context <n>` flag printing a few lines around each hit
    would cut most follow-up `prr context` calls.
-9. **Thread reconciliation for `fixed` threads.** The payload lists existing threads, but verifying
-   “thread marked fixed — is it actually fixed at this revision?” is manual. A helper that maps a
-   thread's anchor onto the current diff (moved/deleted/unchanged) would make the reconciliation
-   step mechanical.
+9. ◐ **Thread reconciliation (partly implemented in v0.4.0).** Threads posted by prr are now
+   recognized across iterations and checked for evidence presence (§11). Threads written by humans
+   are still reconciled by hand.
 10. ✅ **Test-run integration (implemented in v0.3.0).**
     `prr exec --record --timeout <seconds> -- <command> [args...]` runs an argv vector without a
     shell, propagates the exit code, redacts common credentials, caps output, and appends the result
     to `validations.jsonl` for auditable Summary evidence.
 
-## 11. Maintenance policy
+## 11. v0.4.0: lessons from managed AI review services
+
+Comparing the toolkit with a published managed code-review service and its local review command
+surfaced practices worth adopting. Each was implemented only where it stays deterministic; anything
+that needs judgement is a contract the host agent fulfils, enforced by a gate.
+
+| # | Practice | Implementation |
+|---|---|---|
+| 1 | Review instructions come from the base branch, never from the change | `loadRules(..., { rev: baseSHA })`; guidance read from the base tree; `prepare` warns when the change edits review configuration. Previously the project rule file was read from the working tree, so a checked-out change could exempt itself. |
+| 2 | Review against stated intent | `intent.md` from title, description and linked work items (`/pullRequests/{id}/workitems`, `wit/workitems?errorPolicy=Omit`); commit messages for a branch. An excerpt opens every payload. Failures are recorded gaps. |
+| 3 | Separate pre-existing defects | `preExisting: true`; rendered in its own section, never counted as blocking, withheld from posting unless `--include-pre-existing`, SARIF level `note`. |
+| 4 | Find, then independently verify | `challenges` in `prr note` (`confirmed` / `refuted` / `uncertain`). Refuted retracts; uncertain becomes `unconfirmed` (Open Questions). `finalize` blocks until every finding the depth requires has a challenge. The toolkit still never calls a model. |
+| 5 | Re-review reads replies and settles earlier threads | Posted comments end with `prr finding <id>`; `prepare` writes `prior-findings.json` (status, replies, evidence still present). Payload thread lists include replies. `post` skips ids already posted by earlier runs; `post --resolve` replies to and resolves prr threads only. |
+| 6 | Hierarchical guidance files | `AGENTS.md`, `CLAUDE.md`, `REVIEW.md` on the path to each changed file, plus `copilot-instructions.md` and `*.instructions.md` (with `applyTo`) in any `.github` directory. `REVIEW.md` text is inlined per batch; the rest is in `guidance.md`. |
+| 7 | Higher bar for some paths | `minSeverity` on a rule entry; findings below it become `suppressed` (recomputed each finalize, counted in the Summary). |
+| 8 | Cap low-value findings | `maxLowFindings`; extra Low findings are suppressed in recording order. |
+| 9 | Review depth levels | `--depth quick|standard|deep` sets batch size, plan triggering, the challenge requirement and Low handling. |
+| 10 | Risk-tiered human review | `computeRiskTier`: high (2) for security paths, migrations, credential files or > 1000 lines; low (0) for docs/tests only ≤ 300 lines; `alwaysHuman` globs lift low to standard. Advisory only. |
+| 11 | Reasoning and machine-readable output | `rationale` and challenge detail render as “Why this was flagged”; `result.json` (counts, blocking, suggested verdict) and a generated `prr result:` line on the posted summary. |
+
+Also changed: the toolkit is business-agnostic. The built-in `domain-math` risk signal (payment,
+billing, tax and similar words, plus one user's domain vocabulary) was removed; built-in signals are
+technical only. A project declares its business-critical areas through `riskPaths` (glob, weight,
+label) in its rules file, which `prr rules check` reports.
+
+Also fixed: re-noting a finding to mark it duplicate (as the skill instructed) was silently ignored
+because the fingerprint did not change. Duplicates and severity corrections are now explicit
+`duplicates` and `reclassify` edits.
+
+Deliberately not adopted: applying fixes (`--fix`), service-side triggers (comment commands, push
+hooks), and model calls inside the toolkit. Azure DevOps does not document collapsible sections or
+hidden HTML comments in pull request comments, so markers and reasoning are plain markdown.
+
+## 12. Maintenance policy
 
 Keep this plan architectural and repository-agnostic. Do not record private pull request URLs,
 organization names, repository names, customer names, local filesystem paths, tokens, or credentials

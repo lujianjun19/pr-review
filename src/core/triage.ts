@@ -1,6 +1,12 @@
 import type { ChangedFile, FileCategory, FileDecision } from "../types.ts";
 import type { RawChange } from "./git.ts";
-import { isExcludedByRules, rulesForPath, type ResolvedRules } from "./rules.ts";
+import {
+  isExcludedByRules,
+  minSeverityForPath,
+  riskPathsFor,
+  rulesForPath,
+  type ResolvedRules,
+} from "./rules.ts";
 
 /** Rough token estimate. Four characters per token is close enough to size batches. */
 export function estimateTokens(text: string): number {
@@ -78,14 +84,24 @@ const CONFIG_EXTENSIONS = new Set([
   "tfvars",
 ]);
 
-/** Path fragments that raise a file's review priority. */
+/**
+ * Path fragments that raise a file's review priority.
+ *
+ * Technical categories only. The toolkit is business-agnostic: it ships to
+ * every user, so it must not assume which business areas of a codebase matter
+ * most. A project declares those itself through `riskPaths` in a rules file.
+ */
 const RISK_SIGNALS: { pattern: RegExp; weight: number; label: string }[] = [
   { pattern: /auth|login|token|secret|credential|password|crypt|cert|permission|role|acl/i, weight: 5, label: "security" },
   { pattern: /migration|schema|entity|dto|contract|\bapi\b|controller|endpoint|proto/i, weight: 4, label: "contract" },
-  { pattern: /payment|billing|invoice|price|currency|tax|emission|fuel|calculat|solver/i, weight: 3, label: "domain-math" },
   { pattern: /concurren|thread|lock|queue|worker|scheduler|retry|timeout/i, weight: 3, label: "concurrency" },
   { pattern: /cache|session|state|store|repository|persist/i, weight: 2, label: "state" },
 ];
+
+/** Labels of the risk signals a path matches, in declaration order. */
+export function riskSignals(path: string): string[] {
+  return RISK_SIGNALS.filter((signal) => signal.pattern.test(path)).map((signal) => signal.label);
+}
 
 function extensionOf(path: string): string {
   const base = path.slice(path.lastIndexOf("/") + 1);
@@ -126,10 +142,17 @@ const BASE_RISK: Record<FileCategory, number> = {
  * and how much of it changed (churn, damped so one huge formatting commit
  * cannot outrank a small security change).
  */
-export function riskScore(change: RawChange, category: FileCategory): number {
+export function riskScore(
+  change: RawChange,
+  category: FileCategory,
+  rules?: Pick<ResolvedRules, "riskPaths">,
+): number {
   let score = BASE_RISK[category];
   for (const signal of RISK_SIGNALS) {
     if (signal.pattern.test(change.path)) score += signal.weight;
+  }
+  if (rules) {
+    for (const entry of riskPathsFor(change.path, rules)) score += entry.weight;
   }
   const churn = change.adds + change.dels;
   score += Math.min(6, Math.log2(churn + 1));
@@ -192,6 +215,12 @@ export function triage(
 
     const rules =
       decision === "review" && opts.rules ? rulesForPath(change.path, opts.rules) : [];
+    const minSeverity =
+      decision === "review" && opts.rules ? minSeverityForPath(change.path, opts.rules) : undefined;
+    const signals = [
+      ...riskSignals(change.path),
+      ...(opts.rules ? riskPathsFor(change.path, opts.rules).map((entry) => entry.label ?? "project") : []),
+    ].filter((label, index, all) => all.indexOf(label) === index);
 
     return {
       path: change.path,
@@ -203,10 +232,12 @@ export function triage(
       category,
       decision,
       reason,
-      risk: riskScore(change, category),
+      risk: riskScore(change, category, opts.rules),
       tokens,
       changeTrackingId: trackingIds.get(change.path),
       ...(rules.length > 0 ? { rules } : {}),
+      ...(minSeverity ? { minSeverity } : {}),
+      ...(signals.length > 0 ? { signals } : {}),
     } satisfies ChangedFile;
   });
 }

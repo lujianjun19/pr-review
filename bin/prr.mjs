@@ -74,6 +74,14 @@ async function getCredential() {
 
 // src/ado/client.ts
 var API_VERSION = "7.1";
+var WORK_ITEM_FIELDS = [
+  "System.Title",
+  "System.WorkItemType",
+  "System.State",
+  "System.Description",
+  "Microsoft.VSTS.Common.AcceptanceCriteria",
+  "Microsoft.VSTS.TCM.ReproSteps"
+];
 var AdoClient = class {
   target;
   constructor(target) {
@@ -142,6 +150,32 @@ ${body}`);
     const url = `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}/_apis/policy/evaluations?${query.toString()}`;
     const res = await this.requestUrl(url);
     return res.value ?? [];
+  }
+  /** Ids of the work items linked to a pull request. */
+  async listPullRequestWorkItemIds(prId) {
+    const res = await this.request(
+      `/pullRequests/${prId}/workitems`
+    );
+    return (res.value ?? []).map((ref) => Number(ref.id)).filter((id) => Number.isInteger(id) && id > 0);
+  }
+  /**
+   * Reads the fields that state what a work item asks for.
+   *
+   * `errorPolicy=Omit` keeps one deleted or inaccessible item from failing the
+   * whole request; it comes back as null and is dropped.
+   */
+  async getWorkItems(ids) {
+    if (ids.length === 0) return [];
+    const { org, project } = this.target;
+    const query = new URLSearchParams({
+      ids: ids.join(","),
+      fields: WORK_ITEM_FIELDS.join(","),
+      errorPolicy: "Omit",
+      "api-version": API_VERSION
+    });
+    const url = `https://dev.azure.com/${encodeURIComponent(org)}/${encodeURIComponent(project)}/_apis/wit/workitems?${query.toString()}`;
+    const res = await this.requestUrl(url);
+    return (res.value ?? []).filter((item) => item !== null);
   }
   /** Creates a comment thread. The body is sent as JSON, so emoji survive intact. */
   createThread(prId, body) {
@@ -476,6 +510,21 @@ async function grepAtRev(cwd, sha, pattern, opts) {
   const matches = parseGrepOutput(isWorktree(sha) ? "" : sha, out);
   return { matches: matches.slice(0, opts.max), truncated: matches.length > opts.max };
 }
+async function listTree(cwd, rev) {
+  const out = await run("git", ["ls-tree", "-r", "--name-only", "-z", rev], {
+    cwd,
+    allowFailure: true
+  });
+  return splitZ(out);
+}
+async function commitMessages(cwd, base, head, max = 30) {
+  const out = await run(
+    "git",
+    ["log", `--max-count=${max}`, "--format=%B%x00", `${base}..${head}`],
+    { cwd, allowFailure: true }
+  );
+  return splitZ(out).map((message) => message.trim()).filter((message) => message.length > 0);
+}
 
 // src/core/rules.ts
 import { readFile as readFile2 } from "node:fs/promises";
@@ -554,6 +603,8 @@ function matchesAny(path, globs) {
 }
 
 // src/core/rules.ts
+var SEVERITIES = ["critical", "high", "medium", "low"];
+var PROJECT_RULE_PATH = ".pr-review/rules.json";
 var BUILTIN_RULES = [
   {
     path: "**/migrations/**",
@@ -575,45 +626,141 @@ function globalRulePath() {
   const xdg = process.env.XDG_CONFIG_HOME;
   return join2(xdg || join2(homedir(), ".config"), "pr-review", "rules.json");
 }
+function parseRuleFile(text, source) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`${source} is not valid JSON: ${err.message}`);
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${source} must contain a JSON object.`);
+  }
+  const file = raw;
+  const out = {};
+  if (file.rules !== void 0) {
+    if (!Array.isArray(file.rules)) throw new Error(`${source}: "rules" must be an array.`);
+    out.rules = file.rules.map((entry, i) => {
+      const e = entry;
+      const where = `${source}: rules[${i}]`;
+      if (typeof e?.path !== "string" || !e.path) throw new Error(`${where}.path must be a non-empty string.`);
+      if (e.rule !== void 0 && typeof e.rule !== "string") throw new Error(`${where}.rule must be a string.`);
+      if (e.minSeverity !== void 0 && !SEVERITIES.includes(e.minSeverity)) {
+        throw new Error(`${where}.minSeverity must be one of ${SEVERITIES.join(", ")}.`);
+      }
+      if (e.rule === void 0 && e.minSeverity === void 0) {
+        throw new Error(`${where} needs "rule", "minSeverity", or both.`);
+      }
+      return {
+        path: e.path,
+        ...typeof e.rule === "string" ? { rule: e.rule } : {},
+        ...e.mergeBuiltin === true ? { mergeBuiltin: true } : {},
+        ...e.minSeverity !== void 0 ? { minSeverity: e.minSeverity } : {}
+      };
+    });
+  }
+  for (const key of ["exclude", "alwaysHuman"]) {
+    const value = file[key];
+    if (value === void 0) continue;
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+      throw new Error(`${source}: "${key}" must be an array of glob strings.`);
+    }
+    out[key] = value;
+  }
+  if (file.riskPaths !== void 0) {
+    if (!Array.isArray(file.riskPaths)) throw new Error(`${source}: "riskPaths" must be an array.`);
+    out.riskPaths = file.riskPaths.map((entry, i) => {
+      const e = entry;
+      const where = `${source}: riskPaths[${i}]`;
+      if (typeof e?.path !== "string" || !e.path) throw new Error(`${where}.path must be a non-empty string.`);
+      if (typeof e.weight !== "number" || !Number.isFinite(e.weight) || e.weight < 1 || e.weight > 10) {
+        throw new Error(`${where}.weight must be a number from 1 to 10.`);
+      }
+      if (e.label !== void 0 && (typeof e.label !== "string" || !e.label)) {
+        throw new Error(`${where}.label must be a non-empty string.`);
+      }
+      return { path: e.path, weight: e.weight, ...typeof e.label === "string" ? { label: e.label } : {} };
+    });
+  }
+  if (file.maxLowFindings !== void 0) {
+    const n = file.maxLowFindings;
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
+      throw new Error(`${source}: "maxLowFindings" must be a non-negative integer.`);
+    }
+    out.maxLowFindings = n;
+  }
+  return out;
+}
 async function loadRuleFile(path) {
   if (!existsSync(path)) return void 0;
-  try {
-    return JSON.parse(await readFile2(path, "utf8"));
-  } catch (err) {
-    throw new Error(`${path} is not valid JSON: ${err.message}`);
-  }
+  return parseRuleFile(await readFile2(path, "utf8"), path);
 }
-async function loadRules(repoRoot2, explicitPath) {
+async function loadRules(repoRoot2, explicitPath, opts = {}) {
   const layers = [];
   if (explicitPath) {
     const file = await loadRuleFile(explicitPath);
     if (!file) throw new Error(`Rule file not found: ${explicitPath}`);
     layers.push({ path: explicitPath, file });
   }
-  const projectPath = join2(repoRoot2, ".pr-review", "rules.json");
-  layers.push({ path: projectPath, file: await loadRuleFile(projectPath) });
+  if (opts.rev) {
+    const text = await showFile(repoRoot2, opts.rev, PROJECT_RULE_PATH);
+    const label = `${PROJECT_RULE_PATH}@${opts.rev.slice(0, 10)}`;
+    layers.push({ path: label, file: text ? parseRuleFile(text, label) : void 0 });
+  } else {
+    const projectPath = join2(repoRoot2, PROJECT_RULE_PATH);
+    layers.push({ path: projectPath, file: await loadRuleFile(projectPath) });
+  }
   const userPath = globalRulePath();
   layers.push({ path: userPath, file: await loadRuleFile(userPath) });
   const entries = [];
   const exclude = [];
+  const alwaysHuman = [];
+  const riskPaths = [];
   const sources = [];
+  let maxLowFindings;
   for (const layer of layers) {
     if (!layer.file) continue;
     sources.push(layer.path);
     entries.push(...layer.file.rules ?? []);
     exclude.push(...layer.file.exclude ?? []);
+    alwaysHuman.push(...layer.file.alwaysHuman ?? []);
+    riskPaths.push(...layer.file.riskPaths ?? []);
+    if (maxLowFindings === void 0 && layer.file.maxLowFindings !== void 0) {
+      maxLowFindings = layer.file.maxLowFindings;
+    }
   }
-  return { entries, exclude, sources };
+  return {
+    entries,
+    exclude,
+    sources,
+    alwaysHuman,
+    riskPaths,
+    ...maxLowFindings !== void 0 ? { maxLowFindings } : {}
+  };
 }
 function rulesForPath(path, resolved) {
   const userRule = resolved.entries.find((entry) => matchesGlob(path, entry.path));
   const builtin = BUILTIN_RULES.find((entry) => matchesGlob(path, entry.path));
-  if (!userRule) return builtin ? [builtin.rule] : [];
-  if (userRule.mergeBuiltin && builtin) return [userRule.rule, builtin.rule];
-  return [userRule.rule];
+  if (!userRule) return builtin?.rule ? [builtin.rule] : [];
+  const own = userRule.rule ? [userRule.rule] : [];
+  if ((userRule.mergeBuiltin || !userRule.rule) && builtin?.rule) return [...own, builtin.rule];
+  return own;
+}
+function minSeverityForPath(path, resolved) {
+  return resolved.entries.find((entry) => matchesGlob(path, entry.path))?.minSeverity;
 }
 function isExcludedByRules(path, resolved) {
   return matchesAny(path, resolved.exclude);
+}
+function riskPathsFor(path, resolved) {
+  const byKey = /* @__PURE__ */ new Map();
+  for (const entry of resolved.riskPaths) {
+    if (!matchesGlob(path, entry.path)) continue;
+    const key = entry.label ?? entry.path;
+    const known = byKey.get(key);
+    if (!known || entry.weight > known.weight) byKey.set(key, entry);
+  }
+  return [...byKey.values()];
 }
 
 // src/core/triage.ts
@@ -683,10 +830,12 @@ var CONFIG_EXTENSIONS = /* @__PURE__ */ new Set([
 var RISK_SIGNALS = [
   { pattern: /auth|login|token|secret|credential|password|crypt|cert|permission|role|acl/i, weight: 5, label: "security" },
   { pattern: /migration|schema|entity|dto|contract|\bapi\b|controller|endpoint|proto/i, weight: 4, label: "contract" },
-  { pattern: /payment|billing|invoice|price|currency|tax|emission|fuel|calculat|solver/i, weight: 3, label: "domain-math" },
   { pattern: /concurren|thread|lock|queue|worker|scheduler|retry|timeout/i, weight: 3, label: "concurrency" },
   { pattern: /cache|session|state|store|repository|persist/i, weight: 2, label: "state" }
 ];
+function riskSignals(path) {
+  return RISK_SIGNALS.filter((signal) => signal.pattern.test(path)).map((signal) => signal.label);
+}
 function extensionOf(path) {
   const base = path.slice(path.lastIndexOf("/") + 1);
   const dot = base.lastIndexOf(".");
@@ -716,10 +865,13 @@ var BASE_RISK = {
   secret: 0,
   unknown: 3
 };
-function riskScore(change, category) {
+function riskScore(change, category, rules) {
   let score = BASE_RISK[category];
   for (const signal of RISK_SIGNALS) {
     if (signal.pattern.test(change.path)) score += signal.weight;
+  }
+  if (rules) {
+    for (const entry of riskPathsFor(change.path, rules)) score += entry.weight;
   }
   const churn = change.adds + change.dels;
   score += Math.min(6, Math.log2(churn + 1));
@@ -757,6 +909,11 @@ function triage(changes, trackingIds, opts = DEFAULT_TRIAGE) {
       reason = "diff-too-large";
     }
     const rules = decision === "review" && opts.rules ? rulesForPath(change.path, opts.rules) : [];
+    const minSeverity = decision === "review" && opts.rules ? minSeverityForPath(change.path, opts.rules) : void 0;
+    const signals = [
+      ...riskSignals(change.path),
+      ...opts.rules ? riskPathsFor(change.path, opts.rules).map((entry) => entry.label ?? "project") : []
+    ].filter((label, index, all) => all.indexOf(label) === index);
     return {
       path: change.path,
       oldPath: change.oldPath,
@@ -767,10 +924,12 @@ function triage(changes, trackingIds, opts = DEFAULT_TRIAGE) {
       category,
       decision,
       reason,
-      risk: riskScore(change, category),
+      risk: riskScore(change, category, opts.rules),
       tokens,
       changeTrackingId: trackingIds.get(change.path),
-      ...rules.length > 0 ? { rules } : {}
+      ...rules.length > 0 ? { rules } : {},
+      ...minSeverity ? { minSeverity } : {},
+      ...signals.length > 0 ? { signals } : {}
     };
   });
 }
@@ -782,6 +941,16 @@ var DEFAULT_BATCH = {
   planFileLines: 50,
   planGroupLines: 100
 };
+function batchOptionsFor(depth) {
+  switch (depth) {
+    case "quick":
+      return { maxFiles: 15, maxTokens: 4e4, planFileLines: 200, planGroupLines: 400 };
+    case "deep":
+      return { maxFiles: 6, maxTokens: 15e3, planFileLines: 1, planGroupLines: 1 };
+    default:
+      return { ...DEFAULT_BATCH };
+  }
+}
 var MIN_AFFINITY = 4;
 function dirOf(path) {
   const i = path.lastIndexOf("/");
@@ -906,7 +1075,269 @@ function mergeSiblings(batches, opts, rel) {
   return result;
 }
 
+// src/core/guidance.ts
+var SCOPED_NAMES = ["AGENTS.md", "CLAUDE.md", "REVIEW.md"];
+var COPILOT_FILE = /^(?:(.*)\/)?\.github\/copilot-instructions\.md$/;
+var INSTRUCTIONS_FILE = /^(?:(.*)\/)?\.github\/instructions\/[^/]+\.instructions\.md$/;
+function instructionFiles(tree) {
+  return tree.filter((path) => INSTRUCTIONS_FILE.test(path));
+}
+function parseApplyTo(content) {
+  const front = /^---\r?\n([^]*?)\r?\n---/.exec(content);
+  if (!front) return void 0;
+  const line = /^applyTo:\s*(.+)$/m.exec(front[1]);
+  if (!line) return void 0;
+  const value = line[1].trim().replace(/^["']|["']$/g, "");
+  const globs = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of value) {
+    if (ch === "{") depth++;
+    if (ch === "}") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) {
+      globs.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  globs.push(current);
+  const cleaned = globs.map((glob) => glob.trim()).filter(Boolean);
+  return cleaned.length > 0 ? cleaned : void 0;
+}
+function relativeTo(scope, path) {
+  return scope ? path.slice(scope.length + 1) : path;
+}
+function underScope(scope, path) {
+  return scope === "" || path.startsWith(`${scope}/`);
+}
+function dirOf2(path) {
+  const i = path.lastIndexOf("/");
+  return i < 0 ? "" : path.slice(0, i);
+}
+function baseName(path) {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+function ancestors(path) {
+  const dirs = [""];
+  const parts = dirOf2(path).split("/").filter(Boolean);
+  for (let i = 1; i <= parts.length; i++) dirs.push(parts.slice(0, i).join("/"));
+  return dirs;
+}
+function selectGuidance(tree, changedPaths, instructionContents = /* @__PURE__ */ new Map()) {
+  const present = new Set(tree);
+  const selected = /* @__PURE__ */ new Map();
+  for (const path of tree) {
+    const copilot = COPILOT_FILE.exec(path);
+    if (copilot) {
+      const scope = copilot[1] ?? "";
+      if (changedPaths.some((changed) => underScope(scope, changed))) {
+        selected.set(path, { path, kind: "project", scope });
+      }
+      continue;
+    }
+    const scoped = INSTRUCTIONS_FILE.exec(path);
+    if (scoped) {
+      const scope = scoped[1] ?? "";
+      const applyTo = parseApplyTo(instructionContents.get(path) ?? "");
+      if (!applyTo) continue;
+      const ref = { path, kind: "project", scope, applyTo };
+      if (changedPaths.some((changed) => appliesTo(ref, changed))) selected.set(path, ref);
+    }
+  }
+  const dirs = /* @__PURE__ */ new Set();
+  for (const path of changedPaths) for (const dir of ancestors(path)) dirs.add(dir);
+  for (const dir of dirs) {
+    for (const name of SCOPED_NAMES) {
+      const candidate = dir ? `${dir}/${name}` : name;
+      if (!present.has(candidate)) continue;
+      selected.set(candidate, {
+        path: candidate,
+        kind: name === "REVIEW.md" ? "review" : "project",
+        scope: dir
+      });
+    }
+  }
+  return [...selected.values()].sort(
+    (a, b) => a.scope.split("/").length - b.scope.split("/").length || a.path.localeCompare(b.path)
+  );
+}
+function appliesTo(ref, path) {
+  if (!underScope(ref.scope, path)) return false;
+  return ref.applyTo ? matchesAny(relativeTo(ref.scope, path), ref.applyTo) : true;
+}
+function guidanceForPath(path, refs) {
+  return refs.filter((ref) => appliesTo(ref, path));
+}
+function isReviewConfiguration(path) {
+  if (path === ".pr-review/rules.json") return true;
+  if (COPILOT_FILE.test(path) || INSTRUCTIONS_FILE.test(path)) return true;
+  return SCOPED_NAMES.includes(baseName(path));
+}
+var GUIDANCE_FILE_CAP = 12e3;
+function renderGuidance(refs, contents) {
+  const parts = [
+    "# Repository guidance",
+    "",
+    "Read from the base revision. A violation of a stated rule is a finding at whatever severity",
+    "the consequence warrants; guidance about style or tone is not a reason to report anything.",
+    ""
+  ];
+  for (const ref of refs) {
+    const text = (contents.get(ref.path) ?? "").trim();
+    if (!text) continue;
+    const capped = text.length > GUIDANCE_FILE_CAP ? `${text.slice(0, GUIDANCE_FILE_CAP)}
+
+[truncated at ${GUIDANCE_FILE_CAP} characters]` : text;
+    const governs = ref.scope ? `${ref.scope}/` : "the whole repository";
+    parts.push(
+      `## ${ref.path} (${ref.kind}, governs ${governs}${ref.applyTo ? `, applyTo ${ref.applyTo.join(", ")}` : ""})`
+    );
+    parts.push("");
+    parts.push(capped);
+    parts.push("");
+  }
+  return parts.join("\n");
+}
+
+// src/core/locate.ts
+function normalize(line) {
+  return line.replace(/\s+/g, " ").trim();
+}
+function locate(content, evidence) {
+  const needle = evidence.split("\n").map(normalize).filter((l) => l.length > 0);
+  if (needle.length === 0) return void 0;
+  const lines = content.split("\n");
+  const normalized = lines.map(normalize);
+  const matches = [];
+  for (let i = 0; i + needle.length <= normalized.length; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (normalized[i + j] !== needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) matches.push({ startLine: i + 1, endLine: i + needle.length });
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    return "ambiguous";
+  }
+  if (needle.length === 1) {
+    const hits = [];
+    for (let i = 0; i < normalized.length; i++) {
+      if (normalized[i].includes(needle[0])) hits.push({ startLine: i + 1, endLine: i + 1 });
+    }
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) return "ambiguous";
+  }
+  return void 0;
+}
+async function resolveEvidence(repoRoot2, sourceSHA, declaredPath, evidence, otherPaths) {
+  const own = await showFile(repoRoot2, sourceSHA, declaredPath);
+  const hit = own ? locate(own, evidence) : void 0;
+  if (hit && hit !== "ambiguous") return { location: hit, outcome: "resolved" };
+  if (hit === "ambiguous") return { outcome: "ambiguous" };
+  const relocations = [];
+  const ambiguousIn = [];
+  for (const path of otherPaths) {
+    if (path === declaredPath) continue;
+    const content = await showFile(repoRoot2, sourceSHA, path);
+    if (!content) continue;
+    const found = locate(content, evidence);
+    if (found === "ambiguous") ambiguousIn.push(path);
+    else if (found) relocations.push({ path, location: found });
+  }
+  if (relocations.length === 1 && ambiguousIn.length === 0) {
+    return {
+      location: relocations[0].location,
+      relocatedTo: relocations[0].path,
+      outcome: "relocated"
+    };
+  }
+  if (relocations.length + ambiguousIn.length > 1) {
+    return {
+      outcome: "ambiguous-elsewhere",
+      candidates: [...relocations.map((r) => r.path), ...ambiguousIn]
+    };
+  }
+  return { outcome: "not-found" };
+}
+
+// src/core/priorFindings.ts
+var MARKER = /prr finding `([0-9a-f]{6,40})`/;
+var SEVERITY_WORDS = [
+  [/\*\*Critical\*\*/, "critical"],
+  [/\*\*High\*\*/, "high"],
+  [/\*\*Medium\*\*/, "medium"],
+  [/\*\*Low\*\*/, "low"]
+];
+function findingMarker(finding) {
+  return `_prr finding \`${finding.id}\`_`;
+}
+function fenceFor(text) {
+  const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+function readEvidenceBlock(body) {
+  const lines = body.split("\n");
+  const heading = lines.findIndex((line) => line.trim() === "**Evidence**");
+  if (heading < 0) return void 0;
+  const open = lines[heading + 1]?.trim() ?? "";
+  if (!/^`{3,}$/.test(open)) return void 0;
+  const close = lines.findIndex((line, i) => i > heading + 1 && line.trim() === open);
+  if (close < 0) return void 0;
+  return lines.slice(heading + 2, close).join("\n");
+}
+function parseFindingMarker(body) {
+  const match = MARKER.exec(body);
+  if (!match) return void 0;
+  const firstLine = body.split("\n")[0] ?? "";
+  const severity = SEVERITY_WORDS.find(([pattern]) => pattern.test(firstLine))?.[1];
+  const evidence = readEvidenceBlock(body);
+  return {
+    id: match[1],
+    ...severity ? { severity } : {},
+    ...evidence !== void 0 ? { evidence } : {}
+  };
+}
+function stripMarkers(body) {
+  return body.replace(/<!--[^]*?-->/g, "").replace(/_?prr finding `[0-9a-f]+`_?/g, "").trim();
+}
+async function collectPriorFindings(threads, readFile6) {
+  const out = [];
+  const cache2 = /* @__PURE__ */ new Map();
+  for (const thread of threads) {
+    if (thread.isDeleted || thread.comments.length === 0) continue;
+    const marker = parseFindingMarker(thread.comments[0].body);
+    if (!marker) continue;
+    let evidenceStillPresent = null;
+    if (thread.path && marker.evidence) {
+      if (!cache2.has(thread.path)) cache2.set(thread.path, await readFile6(thread.path));
+      const content = cache2.get(thread.path);
+      evidenceStillPresent = content ? locate(content, marker.evidence) !== void 0 : false;
+    }
+    out.push({
+      threadId: thread.id,
+      findingId: marker.id,
+      ...thread.path ? { path: thread.path } : {},
+      ...thread.line !== void 0 ? { line: thread.line } : {},
+      status: thread.status,
+      ...marker.severity ? { severity: marker.severity } : {},
+      ...marker.evidence ? { evidence: marker.evidence } : {},
+      evidenceStillPresent,
+      replies: thread.comments.slice(1).filter((comment) => comment.type !== "system").map((comment) => ({ author: comment.author, body: stripMarkers(comment.body) }))
+    });
+  }
+  return out;
+}
+function isOpenThreadStatus(status2) {
+  return status2 === "active" || status2 === "pending" || status2 === "unknown";
+}
+
 // src/core/payload.ts
+var INLINE_REVIEW_GUIDANCE_CAP = 3e3;
 function annotateDiff(diff) {
   const out = [];
   let newLine = 0;
@@ -936,19 +1367,57 @@ function annotateDiff(diff) {
   }
   return out.join("\n");
 }
-function threadSummary(threads, path) {
+function excerpt(body, limit) {
+  const flat = stripMarkers(body).replace(/\s+/g, " ");
+  return flat.length > limit ? `${flat.slice(0, limit)}\u2026` : flat;
+}
+function threadSummary(threads, path, prior) {
   const relevant = threads.filter((t) => t.path === path && !t.isDeleted && t.comments.length > 0);
   if (relevant.length === 0) return "";
-  const lines = relevant.map((t) => {
+  const priorById = new Map(prior.map((p) => [p.threadId, p]));
+  const lines = [];
+  for (const t of relevant) {
     const first = t.comments[0];
-    const body = first.body.replace(/\s+/g, " ").slice(0, 220);
     const who = t.isBot ? `${first.author} (bot)` : first.author;
-    return `- thread ${t.id} [${t.status}] line ${t.line ?? "?"} \u2014 ${who}: ${body}`;
-  });
+    const mine = priorById.get(t.id);
+    const tag = mine ? ` [prr finding ${mine.findingId}; evidence ${mine.evidenceStillPresent === null ? "unknown" : mine.evidenceStillPresent ? "still present" : "no longer present"}]` : "";
+    lines.push(`- thread ${t.id} [${t.status}]${tag} line ${t.line ?? "?"} \u2014 ${who}: ${excerpt(first.body, 220)}`);
+    const replies = t.comments.slice(1).filter((c) => c.type !== "system");
+    const shown = replies.slice(-3);
+    if (replies.length > shown.length) lines.push(`    \u21B3 (${replies.length - shown.length} earlier repl(ies) omitted)`);
+    for (const reply of shown) lines.push(`    \u21B3 ${reply.author}: ${excerpt(reply.body, 160)}`);
+  }
   return `
-Existing threads on this file (do not repeat these findings):
+Existing threads on this file (do not repeat these findings; read the replies):
 ${lines.join("\n")}
 `;
+}
+function guidanceSection(batch, ctx) {
+  if (!ctx.guidance || ctx.guidance.refs.length === 0) return [];
+  const applicable = /* @__PURE__ */ new Map();
+  for (const path of batch.files) {
+    for (const ref of guidanceForPath(path, ctx.guidance.refs)) applicable.set(ref.path, ref);
+  }
+  if (applicable.size === 0) return [];
+  const out = ["## Repository guidance for these files", ""];
+  const project = [...applicable.values()].filter((ref) => ref.kind === "project");
+  if (project.length > 0) {
+    out.push(
+      `Project guidance (base revision, full text in guidance.md): ${project.map((r) => r.path).join(", ")}. A change that violates a rule stated there is a finding.`,
+      ""
+    );
+  }
+  for (const ref of [...applicable.values()].filter((r) => r.kind === "review")) {
+    const text = (ctx.guidance.contents.get(ref.path) ?? "").trim();
+    if (!text) continue;
+    out.push(`Review instructions from ${ref.path}:`, "");
+    out.push(
+      text.length > INLINE_REVIEW_GUIDANCE_CAP ? `${text.slice(0, INLINE_REVIEW_GUIDANCE_CAP)}
+\u2026[truncated; full text in guidance.md]` : text
+    );
+    out.push("");
+  }
+  return out;
 }
 async function renderPayload(batch, ctx) {
   const parts = [];
@@ -959,11 +1428,21 @@ async function renderPayload(batch, ctx) {
   );
   parts.push(`Source revision: ${ctx.sourceSHA}`);
   parts.push(`Base revision: ${ctx.baseSHA}`);
+  if (ctx.depth) parts.push(`Review depth: ${ctx.depth}`);
   parts.push("");
   parts.push(
     "Line numbers on the left are real line numbers in the source revision. Report them as-is; lines marked `-|` were removed and cannot be commented on."
   );
   parts.push("");
+  if (ctx.intent) {
+    parts.push("## Stated intent", "");
+    parts.push(
+      "Check each change against this: does it do what was asked, completely, without doing something else?",
+      ""
+    );
+    parts.push(ctx.intent, "");
+  }
+  parts.push(...guidanceSection(batch, ctx));
   for (const path of batch.files) {
     const meta = ctx.files.get(path);
     const raw = await fileDiff(ctx.repoRoot, ctx.baseSHA, ctx.sourceSHA, path);
@@ -975,7 +1454,13 @@ async function renderPayload(batch, ctx) {
       parts.push("Project rules for this path:");
       parts.push(...meta.rules.map((rule) => `- ${rule}`));
     }
-    const threadNote = threadSummary(ctx.threads, path);
+    if (meta?.minSeverity) {
+      parts.push("");
+      parts.push(
+        `Reporting threshold for this path: ${meta.minSeverity} and above. Lower findings are suppressed at finalize; record them only if they might be more severe than they look.`
+      );
+    }
+    const threadNote = threadSummary(ctx.threads, path, ctx.priorFindings ?? []);
     if (threadNote) parts.push(threadNote.trimEnd());
     parts.push("```diff");
     parts.push(annotateDiff(raw));
@@ -1140,6 +1625,22 @@ var RunStore = class _RunStore {
   writeBuilds(value) {
     return writeJson(this.path("builds.json"), value);
   }
+  /** Writes a markdown document such as intent.md or guidance.md. */
+  writeText(relative, content) {
+    return writeFile(this.path(relative), content, "utf8");
+  }
+  writePriorFindings(value) {
+    return writeJson(this.path("prior-findings.json"), value);
+  }
+  readPriorFindings() {
+    return readJson(this.path("prior-findings.json"), []);
+  }
+  writeResult(value) {
+    return writeJson(this.path("result.json"), value);
+  }
+  readResult() {
+    return readJson(this.path("result.json"), void 0);
+  }
   readThreads() {
     return readJson(this.path("threads.json"), []);
   }
@@ -1206,10 +1707,143 @@ var RunStore = class _RunStore {
   }
 };
 
+// src/core/intent.ts
+var DESCRIPTION_CAP = 4e3;
+var WORK_ITEM_FIELD_CAP = 1500;
+var COMMIT_CAP = 400;
+var PAYLOAD_INTENT_CAP = 2500;
+var ENTITIES = {
+  "&nbsp;": " ",
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&apos;": "'"
+};
+function htmlToText(html) {
+  return html.replace(/<\s*br\s*\/?>/gi, "\n").replace(/<\s*li[^>]*>/gi, "\n- ").replace(/<\/\s*(p|div|h[1-6]|tr|ul|ol)\s*>/gi, "\n").replace(/<[^>]+>/g, "").replace(/&[a-z#0-9]+;/gi, (entity) => ENTITIES[entity.toLowerCase()] ?? entity).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function demoteHeadings(text) {
+  let fence;
+  return text.split("\n").map((line) => {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) {
+      if (!fence) fence = marker;
+      else if (marker.startsWith(fence)) fence = void 0;
+      return line;
+    }
+    return fence ? line : line.replace(/^(#{1,4})(\s)/, "###$1$2");
+  }).join("\n");
+}
+function cap(text, limit) {
+  const trimmed = text.trim();
+  return trimmed.length > limit ? `${trimmed.slice(0, limit)} \u2026[truncated]` : trimmed;
+}
+function renderIntent(intent) {
+  const parts = ["# Change intent", "", `**Title:** ${intent.title}`, ""];
+  if (intent.description !== void 0) {
+    parts.push("## Description", "");
+    parts.push(
+      intent.description.trim() ? demoteHeadings(cap(intent.description, DESCRIPTION_CAP)) : "_(empty)_"
+    );
+    parts.push("");
+  }
+  if (intent.workItems && intent.workItems.length > 0) {
+    parts.push("## Linked work items", "");
+    for (const item of intent.workItems) {
+      const label = [item.type, item.state].filter(Boolean).join(", ");
+      parts.push(`### #${item.id} ${item.title ?? ""}${label ? ` (${label})` : ""}`.trimEnd());
+      if (item.description) {
+        parts.push("", cap(htmlToText(item.description), WORK_ITEM_FIELD_CAP));
+      }
+      if (item.acceptanceCriteria) {
+        parts.push("", "**Acceptance criteria**", "", cap(htmlToText(item.acceptanceCriteria), WORK_ITEM_FIELD_CAP));
+      }
+      parts.push("");
+    }
+  } else if (intent.workItemsError) {
+    parts.push(`_Linked work items unavailable: ${intent.workItemsError}_`, "");
+  } else if (intent.workItems) {
+    parts.push("_No linked work items._", "");
+  }
+  if (intent.commits && intent.commits.length > 0) {
+    parts.push("## Commit messages (newest first)", "");
+    for (const message of intent.commits) {
+      parts.push(`- ${cap(message, COMMIT_CAP).replace(/\n+/g, "\n  ")}`);
+    }
+    parts.push("");
+  }
+  return parts.join("\n");
+}
+function intentExcerpt(rendered) {
+  const body = rendered.replace(/^# Change intent\s*/, "").trim();
+  if (body.length <= PAYLOAD_INTENT_CAP) return body;
+  return `${body.slice(0, PAYLOAD_INTENT_CAP)}
+
+\u2026[excerpt; the full text is in intent.md]`;
+}
+
+// src/core/riskTier.ts
+var LARGE_CHURN = 1e3;
+var SMALL_CHURN = 300;
+var LOW_RISK_CATEGORIES = /* @__PURE__ */ new Set(["docs", "test", "generated", "lock"]);
+var MIGRATION = /(^|\/)migrations?\//i;
+function computeRiskTier(files, alwaysHuman = []) {
+  const high = [];
+  const humans = [];
+  const security = files.filter((f) => f.decision !== "skip" && f.signals?.includes("security"));
+  if (security.length > 0) {
+    high.push(`security-sensitive path: ${listPaths(security)}`);
+  }
+  const migrations = files.filter((f) => MIGRATION.test(f.path) && f.category !== "generated");
+  if (migrations.length > 0) {
+    high.push(`schema migration: ${listPaths(migrations)}`);
+  }
+  const secrets = files.filter((f) => f.reason === "secret-path");
+  if (secrets.length > 0) {
+    high.push(`credential-like file changed: ${listPaths(secrets)}`);
+  }
+  const churn = files.filter((f) => f.decision === "review").reduce((sum, f) => sum + f.adds + f.dels, 0);
+  if (churn > LARGE_CHURN) {
+    high.push(`${churn} reviewable lines changed (> ${LARGE_CHURN})`);
+  }
+  if (alwaysHuman.length > 0) {
+    const pinned = files.filter((f) => matchesAny(f.path, alwaysHuman));
+    if (pinned.length > 0) humans.push(`always-human path: ${listPaths(pinned)}`);
+  }
+  if (high.length > 0) {
+    return { tier: "high", approvers: 2, reasons: [...high, ...humans] };
+  }
+  const behavioural = files.filter((f) => !LOW_RISK_CATEGORIES.has(f.category));
+  if (behavioural.length === 0 && churn <= SMALL_CHURN && humans.length === 0) {
+    return {
+      tier: "low",
+      approvers: 0,
+      reasons: [`only ${describeCategories(files)} changed, ${churn} lines`]
+    };
+  }
+  const reasons = [...humans];
+  if (behavioural.length > 0) {
+    reasons.push(`${behavioural.length} behavioural file(s), ${churn} reviewable lines`);
+  }
+  return { tier: "standard", approvers: 1, reasons };
+}
+function listPaths(files) {
+  const shown = files.slice(0, 3).map((f) => f.path);
+  return files.length > 3 ? `${shown.join(", ")} (+${files.length - 3} more)` : shown.join(", ");
+}
+function describeCategories(files) {
+  const categories = [...new Set(files.map((f) => f.category))].sort();
+  return categories.length > 0 ? categories.join("/") : "no";
+}
+
 // src/version.ts
-var TOOL_VERSION = "0.3.0";
+var TOOL_VERSION = "0.4.0";
 
 // src/commands/prepare.ts
+var DEPTHS = ["quick", "standard", "deep"];
+var MAX_WORK_ITEMS = 10;
 async function resolveTarget(target, cwd) {
   const fromUrl = parsePrUrl(target);
   if (fromUrl?.prId) return fromUrl;
@@ -1225,6 +1859,28 @@ async function resolveTarget(target, cwd) {
     );
   }
   return { ...fromRemote, prId };
+}
+function fieldText(item, name) {
+  const value = item.fields?.[name];
+  return typeof value === "string" && value.trim() ? value : void 0;
+}
+async function loadWorkItems(client, prId) {
+  try {
+    const ids = (await client.listPullRequestWorkItemIds(prId)).slice(0, MAX_WORK_ITEMS);
+    const items = await client.getWorkItems(ids);
+    return {
+      items: items.map((item) => ({
+        id: item.id,
+        type: fieldText(item, "System.WorkItemType"),
+        state: fieldText(item, "System.State"),
+        title: fieldText(item, "System.Title"),
+        description: fieldText(item, "System.Description") ?? fieldText(item, "Microsoft.VSTS.TCM.ReproSteps"),
+        acceptanceCriteria: fieldText(item, "Microsoft.VSTS.Common.AcceptanceCriteria")
+      }))
+    };
+  } catch (err) {
+    return { error: err.message.split("\n")[0].slice(0, 200) };
+  }
 }
 async function optionalEvidence(load) {
   try {
@@ -1262,11 +1918,12 @@ async function prepareAdoScope(args, root) {
     items: [],
     error: projectId ? void 0 : "Pull request metadata did not include a project id."
   };
-  const [threads, changeEntries, builds, policies] = await Promise.all([
+  const [threads, changeEntries, builds, policies, workItems] = await Promise.all([
     client.listThreads(target.prId),
     client.listIterationChanges(target.prId, iteration.id, args.since),
     optionalEvidence(() => client.listPullRequestStatuses(target.prId)),
-    projectId ? optionalEvidence(() => client.listPolicyEvaluations(target.prId, projectId)) : Promise.resolve(unavailablePolicies)
+    projectId ? optionalEvidence(() => client.listPolicyEvaluations(target.prId, projectId)) : Promise.resolve(unavailablePolicies),
+    loadWorkItems(client, target.prId)
   ]);
   const cred = await getCredential();
   await fetchCommits(root, remoteUrlFor(target), [sourceSHA, baseSHA], cred.header);
@@ -1318,10 +1975,18 @@ async function prepareAdoScope(args, root) {
         createdDate: it.createdDate,
         description: it.description,
         sourceSHA: it.sourceRefCommit.commitId
-      }))
+      })),
+      workItems: workItems.items ?? [],
+      ...workItems.error ? { workItemsError: workItems.error } : {}
     },
     policies,
     builds,
+    intent: {
+      title: pr.title,
+      description: pr.description ?? "",
+      ...workItems.items ? { workItems: workItems.items } : {},
+      ...workItems.error ? { workItemsError: workItems.error } : {}
+    },
     credentialSource: cred.source
   };
 }
@@ -1352,7 +2017,9 @@ async function prepareLocalScope(args, root) {
   const baseRef = args.branch;
   const base = await mergeBase(root, baseRef, "HEAD");
   const sourceSHA = await revParse(root, "HEAD");
+  const commits = await commitMessages(root, base, sourceSHA);
   return {
+    intent: { title: commits[0]?.split("\n")[0] ?? `${branch} vs ${baseRef}`, commits },
     meta: {
       toolVersion: TOOL_VERSION,
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1380,8 +2047,12 @@ async function prepare(args) {
       "`prr prepare` needs a pull request URL or id, or --branch <base>, or --working-tree."
     );
   }
+  const depth = args.depth ?? "standard";
+  if (!DEPTHS.includes(depth)) {
+    throw new Error(`--depth must be one of ${DEPTHS.join(", ")}.`);
+  }
   const scope = isLocal ? await prepareLocalScope(args, root) : await prepareAdoScope(args, root);
-  const rules = await loadRules(root, args.rule);
+  const rules = await loadRules(root, args.rule, { rev: scope.meta.baseSHA });
   let changes = await listChanges(root, scope.meta.baseSHA, scope.meta.sourceSHA);
   if (args.since !== void 0 && scope.iterationPaths) {
     changes = changes.filter((c) => scope.iterationPaths.has(c.path));
@@ -1397,17 +2068,39 @@ async function prepare(args) {
     );
     files = collapseGeneratedDuplicates(files, new Map(contentPairs));
   }
+  const preset = batchOptionsFor(depth);
   const batches = buildBatches(files, {
-    maxFiles: args.maxFiles ?? 10,
-    maxTokens: args.maxTokens ?? 25e3,
-    planFileLines: 50,
-    planGroupLines: 100
+    ...preset,
+    ...args.maxFiles !== void 0 ? { maxFiles: args.maxFiles } : {},
+    ...args.maxTokens !== void 0 ? { maxTokens: args.maxTokens } : {}
   });
+  const reviewPaths = files.filter((f) => f.decision === "review").map((f) => f.path);
+  const baseTree = await listTree(root, scope.meta.baseSHA);
+  const guidanceContents = /* @__PURE__ */ new Map();
+  for (const path of instructionFiles(baseTree)) {
+    guidanceContents.set(path, await showFile(root, scope.meta.baseSHA, path));
+  }
+  const guidanceRefs = selectGuidance(baseTree, reviewPaths, guidanceContents);
+  for (const ref of guidanceRefs) {
+    if (!guidanceContents.has(ref.path)) {
+      guidanceContents.set(ref.path, await showFile(root, scope.meta.baseSHA, ref.path));
+    }
+  }
+  const configChanges = files.filter((f) => isReviewConfiguration(f.path)).map((f) => f.path);
+  const priorFindings = await collectPriorFindings(
+    scope.threads,
+    (path) => showFile(root, scope.meta.sourceSHA, path)
+  );
+  const riskTier = computeRiskTier(files, rules.alwaysHuman);
   const runDir = runDirFor(scope.meta);
   const meta = {
     ...scope.meta,
     runDir,
-    ...rules.sources.length > 0 ? { ruleSources: rules.sources } : {}
+    depth,
+    riskTier,
+    ...rules.sources.length > 0 ? { ruleSources: rules.sources } : {},
+    ...rules.maxLowFindings !== void 0 ? { limits: { maxLowFindings: rules.maxLowFindings } } : {},
+    ...guidanceRefs.length > 0 ? { guidanceFiles: guidanceRefs.map((ref) => ref.path) } : {}
   };
   const store = await RunStore.create(meta);
   const carried = await store.carriedProgress();
@@ -1418,6 +2111,12 @@ async function prepare(args) {
   await store.writeThreads(scope.threads);
   await store.writeFiles(files);
   await store.writeBatches(batches);
+  await store.writePriorFindings(priorFindings);
+  const intentDoc = scope.intent ? renderIntent(scope.intent) : void 0;
+  if (intentDoc) await store.writeText("intent.md", intentDoc);
+  if (guidanceRefs.length > 0) {
+    await store.writeText("guidance.md", renderGuidance(guidanceRefs, guidanceContents));
+  }
   const fileMap = new Map(files.map((f) => [f.path, f]));
   for (const batch of batches) {
     const content = await renderPayload(batch, {
@@ -1425,21 +2124,30 @@ async function prepare(args) {
       baseSHA: meta.baseSHA,
       sourceSHA: meta.sourceSHA,
       files: fileMap,
-      threads: scope.threads
+      threads: scope.threads,
+      depth,
+      ...intentDoc ? { intent: intentExcerpt(intentDoc) } : {},
+      guidance: { refs: guidanceRefs, contents: guidanceContents },
+      priorFindings
     });
     await store.writePayload(batch.payload, content);
   }
-  return formatSummary(
+  return formatSummary({
     meta,
     files,
     batches,
-    scope.threads.length,
-    scope.credentialSource,
-    args.reset ? 0 : carried,
-    rules.sources,
-    scope.policies,
-    scope.builds
-  );
+    threadCount: scope.threads.length,
+    credSource: scope.credentialSource,
+    carried: args.reset ? 0 : carried,
+    ruleSources: rules.sources,
+    policies: scope.policies,
+    builds: scope.builds,
+    intent: scope.intent,
+    guidance: guidanceRefs,
+    configChanges,
+    priorFindings,
+    riskTier
+  });
 }
 function evidenceSummary(evidence) {
   if (!evidence) return "not applicable";
@@ -1452,7 +2160,8 @@ function evidenceSummary(evidence) {
   }
   return [...counts].map(([state, count]) => `${state} x${count}`).join(", ");
 }
-function formatSummary(meta, files, batches, threadCount, credSource, carried, ruleSources, policies, builds) {
+function formatSummary(input) {
+  const { meta, files, batches, threadCount, credSource, carried, ruleSources, policies, builds } = input;
   const counts = { review: 0, "stat-only": 0, skip: 0 };
   for (const f of files) counts[f.decision]++;
   const lines = [];
@@ -1483,6 +2192,36 @@ function formatSummary(meta, files, batches, threadCount, credSource, carried, r
   }
   if (ruleSources.length > 0) {
     lines.push(`  rules: ${ruleSources.join(", ")}`);
+  }
+  lines.push(`  depth: ${meta.depth ?? "standard"}`);
+  lines.push(
+    `  risk tier: ${input.riskTier.tier} (${input.riskTier.approvers} human approver(s) suggested)` + (input.riskTier.reasons.length > 0 ? ` \u2014 ${input.riskTier.reasons.join("; ")}` : "")
+  );
+  if (input.intent) {
+    const items = input.intent.workItems;
+    const parts = [
+      input.intent.description !== void 0 ? input.intent.description.trim() ? "description" : "empty description" : void 0,
+      items ? `${items.length} work item(s)` : void 0,
+      input.intent.workItemsError ? "work items unavailable" : void 0,
+      input.intent.commits ? `${input.intent.commits.length} commit message(s)` : void 0
+    ].filter(Boolean);
+    lines.push(`  intent: ${parts.join(", ") || "title only"} (intent.md)`);
+  }
+  if (input.guidance.length > 0) {
+    lines.push(`  guidance: ${input.guidance.map((ref) => ref.path).join(", ")} (guidance.md, base revision)`);
+  }
+  if (input.configChanges.length > 0) {
+    lines.push(
+      `  WARNING: this change edits review configuration (${input.configChanges.join(", ")}); the base revision copy was applied. Review the edit itself as a finding candidate.`
+    );
+  }
+  if (input.priorFindings.length > 0) {
+    const open = input.priorFindings.filter((p) => isOpenThreadStatus(p.status));
+    const gone = open.filter((p) => p.evidenceStillPresent === false).length;
+    const replied = open.filter((p) => p.replies.length > 0).length;
+    lines.push(
+      `  prior prr findings: ${input.priorFindings.length} posted, ${open.length} open \xB7 ${gone} with evidence gone (fix candidates) \xB7 ${replied} with replies (prior-findings.json)`
+    );
   }
   if (meta.scope === "ado-pr") {
     lines.push(`  policies: ${evidenceSummary(policies)}`);
@@ -1541,8 +2280,9 @@ function isValidFindingVerification(verification) {
 }
 
 // src/commands/note.ts
-var SEVERITIES = ["critical", "high", "medium", "low"];
+var SEVERITIES2 = ["critical", "high", "medium", "low"];
 var VERDICTS = ["clean", "findings", "cross-batch"];
+var CHALLENGE_OUTCOMES = ["confirmed", "refuted", "uncertain"];
 function fail(message) {
   throw new Error(message);
 }
@@ -1574,8 +2314,8 @@ function validateFinding(raw, index, knownPaths) {
     );
   }
   const severity = raw.severity;
-  if (!SEVERITIES.includes(severity)) {
-    fail(`${where}: "severity" must be one of ${SEVERITIES.join(", ")}.`);
+  if (!SEVERITIES2.includes(severity)) {
+    fail(`${where}: "severity" must be one of ${SEVERITIES2.join(", ")}.`);
   }
   for (const field of ["problem", "evidence", "fix"]) {
     if (!raw[field] || !String(raw[field]).trim()) {
@@ -1599,6 +2339,8 @@ function validateFinding(raw, index, knownPaths) {
     evidence: raw.evidence,
     fix: raw.fix.trim(),
     fixedCode: raw.fixedCode,
+    ...raw.preExisting === true ? { preExisting: true } : {},
+    ...typeof raw.rationale === "string" && raw.rationale.trim() ? { rationale: raw.rationale.trim() } : {},
     status: "candidate",
     ...verification ? { verification } : {},
     batch: raw.batch,
@@ -1697,10 +2439,12 @@ async function note(args) {
   const fresh = incoming.filter((f) => !seen.has(f.id));
   await store.appendVerdicts(verdicts);
   await store.appendFindings(fresh);
+  const corrected = await applyCorrections(store, input);
+  const challenged = await applyChallenges(store, input, await store.readFindings());
   const retractIds = input.retract ?? [];
   let retracted = 0;
   if (retractIds.length > 0) {
-    const all = [...existing, ...fresh];
+    const all = await store.readFindings();
     const byId = new Map(all.map((f) => [f.id, f]));
     for (const id of retractIds) {
       if (!byId.has(id)) {
@@ -1714,83 +2458,80 @@ async function note(args) {
     retracted = retractIds.length;
   }
   const duplicates = incoming.length - fresh.length;
-  const bySeverity = /* @__PURE__ */ new Map();
-  for (const f of fresh) bySeverity.set(f.severity, (bySeverity.get(f.severity) ?? 0) + 1);
+  const bySeverity2 = /* @__PURE__ */ new Map();
+  for (const f of fresh) bySeverity2.set(f.severity, (bySeverity2.get(f.severity) ?? 0) + 1);
   const lines = [
-    `recorded ${verdicts.length} verdict(s), ${fresh.length} finding(s)` + (duplicates > 0 ? ` (${duplicates} already recorded, ignored)` : "") + (retracted > 0 ? `, ${retracted} finding(s) retracted` : "")
+    `recorded ${verdicts.length} verdict(s), ${fresh.length} finding(s)` + (duplicates > 0 ? ` (${duplicates} already recorded, ignored)` : "") + (retracted > 0 ? `, ${retracted} finding(s) retracted` : "") + (corrected.duplicates > 0 ? `, ${corrected.duplicates} marked duplicate` : "") + (corrected.reclassified > 0 ? `, ${corrected.reclassified} reclassified` : "") + (challenged.total > 0 ? `, ${challenged.total} challenge(s): ${challenged.confirmed} confirmed, ${challenged.refuted} refuted (retracted), ${challenged.uncertain} uncertain` : "")
   ];
   if (fresh.length > 0) {
-    lines.push(`  severities: ${[...bySeverity].map(([s, n]) => `${s} x${n}`).join(", ")}`);
+    lines.push(`  severities: ${[...bySeverity2].map(([s, n]) => `${s} x${n}`).join(", ")}`);
   }
   const done = new Set((await store.readVerdicts()).map((v) => v.path));
   const covered = [...reviewable].filter((path) => done.has(path)).length;
   lines.push(`coverage: ${covered}/${reviewable.size} reviewable files have a verdict`);
   return lines.join("\n");
 }
-
-// src/core/locate.ts
-function normalize(line) {
-  return line.replace(/\s+/g, " ").trim();
-}
-function locate(content, evidence) {
-  const needle = evidence.split("\n").map(normalize).filter((l) => l.length > 0);
-  if (needle.length === 0) return void 0;
-  const lines = content.split("\n");
-  const normalized = lines.map(normalize);
-  const matches = [];
-  for (let i = 0; i + needle.length <= normalized.length; i++) {
-    let ok = true;
-    for (let j = 0; j < needle.length; j++) {
-      if (normalized[i + j] !== needle[j]) {
-        ok = false;
-        break;
-      }
+async function applyChallenges(store, input, all) {
+  const entries = input.challenges ?? [];
+  const tally = { total: 0, confirmed: 0, refuted: 0, uncertain: 0 };
+  if (entries.length === 0) return tally;
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  for (const [index, entry] of entries.entries()) {
+    const where = `challenges[${index}]`;
+    const finding = byId.get(entry?.id);
+    if (!finding) fail(`${where}: "${entry?.id}" is not a recorded finding id.`);
+    if (!CHALLENGE_OUTCOMES.includes(entry.outcome)) {
+      fail(`${where}: "outcome" must be one of ${CHALLENGE_OUTCOMES.join(", ")}.`);
     }
-    if (ok) matches.push({ startLine: i + 1, endLine: i + needle.length });
-  }
-  if (matches.length === 1) return matches[0];
-  if (matches.length > 1) {
-    return "ambiguous";
-  }
-  if (needle.length === 1) {
-    const hits = [];
-    for (let i = 0; i < normalized.length; i++) {
-      if (normalized[i].includes(needle[0])) hits.push({ startLine: i + 1, endLine: i + 1 });
+    const detail = (entry.detail ?? "").trim();
+    if (!detail) fail(`${where}: "detail" is required \u2014 say what was checked.`);
+    if (finding.status === "retracted" || finding.status === "duplicate") {
+      fail(`${where}: finding ${finding.id} is ${finding.status}, which is terminal.`);
     }
-    if (hits.length === 1) return hits[0];
-    if (hits.length > 1) return "ambiguous";
+    const challenge = { outcome: entry.outcome, detail, by: entry.by?.trim() || "unspecified", at: now };
+    byId.set(
+      finding.id,
+      entry.outcome === "refuted" ? { ...finding, challenge, status: "retracted", retractReason: detail } : { ...finding, challenge }
+    );
+    tally.total++;
+    tally[entry.outcome]++;
   }
-  return void 0;
+  await store.replaceFindings(all.map((f) => byId.get(f.id)));
+  return tally;
 }
-async function resolveEvidence(repoRoot2, sourceSHA, declaredPath, evidence, otherPaths) {
-  const own = await showFile(repoRoot2, sourceSHA, declaredPath);
-  const hit = own ? locate(own, evidence) : void 0;
-  if (hit && hit !== "ambiguous") return { location: hit, outcome: "resolved" };
-  if (hit === "ambiguous") return { outcome: "ambiguous" };
-  const relocations = [];
-  const ambiguousIn = [];
-  for (const path of otherPaths) {
-    if (path === declaredPath) continue;
-    const content = await showFile(repoRoot2, sourceSHA, path);
-    if (!content) continue;
-    const found = locate(content, evidence);
-    if (found === "ambiguous") ambiguousIn.push(path);
-    else if (found) relocations.push({ path, location: found });
+async function applyCorrections(store, input) {
+  const duplicates = input.duplicates ?? [];
+  const reclassify = input.reclassify ?? [];
+  if (duplicates.length === 0 && reclassify.length === 0) return { duplicates: 0, reclassified: 0 };
+  const all = await store.readFindings();
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const editable = (id, where) => {
+    const finding = byId.get(id);
+    if (!finding) fail(`${where}: "${id}" is not a recorded finding id.`);
+    if (finding.status === "retracted" || finding.status === "duplicate") {
+      fail(`${where}: finding ${id} is ${finding.status}, which is terminal.`);
+    }
+    return finding;
+  };
+  for (const [index, entry] of duplicates.entries()) {
+    const where = `duplicates[${index}]`;
+    const finding = editable(entry?.id, where);
+    if (!Number.isInteger(entry.thread) || entry.thread <= 0) {
+      fail(`${where}: "thread" must be the id of the existing thread that covers it.`);
+    }
+    byId.set(finding.id, { ...finding, status: "duplicate", dupOfThread: entry.thread });
   }
-  if (relocations.length === 1 && ambiguousIn.length === 0) {
-    return {
-      location: relocations[0].location,
-      relocatedTo: relocations[0].path,
-      outcome: "relocated"
-    };
+  for (const [index, entry] of reclassify.entries()) {
+    const where = `reclassify[${index}]`;
+    const finding = editable(entry?.id, where);
+    if (!SEVERITIES2.includes(entry.severity)) {
+      fail(`${where}: "severity" must be one of ${SEVERITIES2.join(", ")}.`);
+    }
+    byId.set(finding.id, { ...byId.get(finding.id), severity: entry.severity });
   }
-  if (relocations.length + ambiguousIn.length > 1) {
-    return {
-      outcome: "ambiguous-elsewhere",
-      candidates: [...relocations.map((r) => r.path), ...ambiguousIn]
-    };
-  }
-  return { outcome: "not-found" };
+  await store.replaceFindings(all.map((f) => byId.get(f.id)));
+  return { duplicates: duplicates.length, reclassified: reclassify.length };
 }
 
 // src/core/sarif.ts
@@ -1817,7 +2558,8 @@ function renderSarif(findings, meta) {
   }));
   const results = publishable.map((finding) => ({
     ruleId: finding.category,
-    level: SARIF_LEVEL[finding.severity],
+    // A defect the change did not introduce is context, not a gate on this change.
+    level: finding.preExisting ? "note" : SARIF_LEVEL[finding.severity],
     message: { text: `${finding.problem}
 
 Fix: ${finding.fix}` },
@@ -1825,7 +2567,9 @@ Fix: ${finding.fix}` },
       severity: finding.severity,
       "security-severity": SEVERITY_SCORE[finding.severity],
       fingerprint: finding.id,
-      ...finding.verification ? { verification: finding.verification } : {}
+      ...finding.verification ? { verification: finding.verification } : {},
+      ...finding.preExisting ? { preExisting: true } : {},
+      ...finding.challenge ? { challenge: finding.challenge.outcome } : {}
     },
     partialFingerprints: { prReviewFindingId: finding.id },
     locations: [
@@ -1889,7 +2633,45 @@ var SEVERITY_LABEL = {
   medium: "\u{1F7E1} **Medium**",
   low: "\u{1F535} **Low**"
 };
+var SEVERITY_NAME = {
+  critical: "Critical",
+  high: "High",
+  medium: "Medium",
+  low: "Low"
+};
 var SEVERITY_ORDER = ["critical", "high", "medium", "low"];
+var PRE_EXISTING_LABEL = "\u{1F7E3} **Pre-existing**";
+function challengeRequired(depth, finding) {
+  if (finding.preExisting) return false;
+  if (depth === "quick") return false;
+  if (depth === "deep") return true;
+  return finding.severity !== "low";
+}
+function applySuppression(findings, files, meta) {
+  const minByPath = new Map(files.map((f) => [f.path, f.minSeverity]));
+  const depth = meta.depth ?? "standard";
+  const out = findings.map((finding) => {
+    if (finding.status !== "verified") return finding;
+    const min = minByPath.get(finding.path);
+    if (min && SEVERITY_ORDER.indexOf(finding.severity) > SEVERITY_ORDER.indexOf(min)) {
+      return { ...finding, status: "suppressed", suppressedReason: `below the ${min} threshold for this path` };
+    }
+    if (depth === "quick" && finding.severity === "low") {
+      return { ...finding, status: "suppressed", suppressedReason: "quick reviews report Medium and above" };
+    }
+    return finding;
+  });
+  const cap2 = meta.limits?.maxLowFindings;
+  if (cap2 !== void 0) {
+    const lows = out.map((finding, index) => ({ finding, index })).filter(({ finding }) => finding.status === "verified" && finding.severity === "low" && !finding.preExisting).sort(
+      (a, b) => (a.finding.batch ?? 0) - (b.finding.batch ?? 0) || a.finding.createdAt.localeCompare(b.finding.createdAt)
+    );
+    for (const { finding, index } of lows.slice(cap2)) {
+      out[index] = { ...finding, status: "suppressed", suppressedReason: `over the cap of ${cap2} Low findings` };
+    }
+  }
+  return out;
+}
 function shingles(text) {
   const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 2);
   const out = /* @__PURE__ */ new Set();
@@ -1934,6 +2716,7 @@ async function finalize(args) {
       continue;
     }
     const updated = { ...finding };
+    delete updated.suppressedReason;
     if (assertsDependencyApi(finding.problem, finding.fix) && !isValidFindingVerification(finding.verification)) {
       updated.status = "unverified";
       notes.push(
@@ -1942,26 +2725,26 @@ async function finalize(args) {
       verified.push(updated);
       continue;
     }
-    const result = await resolveEvidence(
+    const result2 = await resolveEvidence(
       meta.repoRoot,
       meta.sourceSHA,
       finding.path,
       finding.evidence,
       reviewablePaths
     );
-    switch (result.outcome) {
+    switch (result2.outcome) {
       case "resolved":
         updated.status = "verified";
-        updated.line = result.location.startLine;
-        updated.endLine = result.location.endLine;
+        updated.line = result2.location.startLine;
+        updated.endLine = result2.location.endLine;
         break;
       case "relocated":
         updated.status = "verified";
-        updated.path = result.relocatedTo;
-        updated.line = result.location.startLine;
-        updated.endLine = result.location.endLine;
+        updated.path = result2.relocatedTo;
+        updated.line = result2.location.startLine;
+        updated.endLine = result2.location.endLine;
         notes.push(
-          `  ${finding.id}: evidence lives in ${result.relocatedTo}, finding re-filed there`
+          `  ${finding.id}: evidence lives in ${result2.relocatedTo}, finding re-filed there`
         );
         break;
       case "ambiguous":
@@ -1973,7 +2756,7 @@ async function finalize(args) {
       case "ambiguous-elsewhere":
         updated.status = "unlocated";
         notes.push(
-          `  ${finding.id} (${finding.path}): evidence is absent here but present in ${result.candidates.length} other changed files (${result.candidates.slice(0, 2).join(", ")}); name the right file or quote a longer span`
+          `  ${finding.id} (${finding.path}): evidence is absent here but present in ${result2.candidates.length} other changed files (${result2.candidates.slice(0, 2).join(", ")}); name the right file or quote a longer span`
         );
         break;
       default:
@@ -1982,8 +2765,17 @@ async function finalize(args) {
           `  ${finding.id} (${finding.path}): evidence not found at ${meta.sourceSHA.slice(0, 10)}; move to Open Questions or quote the code exactly`
         );
     }
+    if (updated.status === "verified" && updated.challenge?.outcome === "uncertain") {
+      updated.status = "unconfirmed";
+      notes.push(
+        `  ${finding.id} (${finding.path}): the independent challenge was uncertain; report it under Open Questions, not Findings`
+      );
+    }
     verified.push(updated);
   }
+  const depth = meta.depth ?? "standard";
+  const settled = applySuppression(verified, files, meta);
+  verified.splice(0, verified.length, ...settled);
   await store.replaceFindings(verified);
   const lastVerdict = /* @__PURE__ */ new Map();
   for (const v of verdicts) lastVerdict.set(v.path, v.verdict);
@@ -1993,20 +2785,36 @@ async function finalize(args) {
   const crossBatch = [...lastVerdict].filter(([path, verdict]) => reviewableSet.has(path) && verdict === "cross-batch").map(([path]) => path);
   const publishable = verified.filter((f) => f.status === "verified");
   const blocked = verified.filter(
-    (f) => f.status !== "verified" && f.status !== "duplicate" && f.status !== "retracted"
+    (f) => f.status === "candidate" || f.status === "unverified" || f.status === "unlocated"
+  );
+  const unconfirmed = verified.filter((f) => f.status === "unconfirmed");
+  const suppressed = verified.filter((f) => f.status === "suppressed");
+  const unchallenged = publishable.filter(
+    (f) => challengeRequired(depth, f) && f.challenge === void 0
   );
   if (args.render) {
     if (args.format === "sarif") return { output: renderSarif(verified, meta), ok: true };
     if (args.format === "json") return { output: renderJson(verified, meta), ok: true };
-    return { output: renderFindings(publishable, threads), ok: true };
+    return { output: renderFindings(verified, threads), ok: true };
   }
   const lines = [];
   lines.push(
     meta.scope === "ado-pr" ? `PR ${meta.prId} \xB7 iteration ${meta.iterationId} \xB7 ${meta.sourceSHA.slice(0, 10)}` : `${meta.scope} \xB7 ${meta.title} \xB7 ${meta.sourceSHA.slice(0, 10)}`
   );
+  const preExisting = publishable.filter((f) => f.preExisting).length;
   lines.push(
-    `findings: ${publishable.length} verified, ${blocked.length} not publishable, ${verified.filter((f) => f.status === "duplicate").length} marked duplicate, ${verified.filter((f) => f.status === "retracted").length} retracted`
+    `findings: ${publishable.length} verified` + (preExisting > 0 ? ` (${preExisting} pre-existing)` : "") + `, ${blocked.length} not publishable, ${unconfirmed.length} unconfirmed, ${suppressed.length} suppressed, ${verified.filter((f) => f.status === "duplicate").length} marked duplicate, ${verified.filter((f) => f.status === "retracted").length} retracted`
   );
+  if (suppressed.length > 0) {
+    const reasons = /* @__PURE__ */ new Map();
+    for (const f of suppressed) {
+      const reason = f.suppressedReason ?? "suppressed";
+      reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+    }
+    lines.push(
+      `suppressed: ${[...reasons].map(([reason, n]) => `${n} ${reason}`).join("; ")} (count them in the Summary; do not report them as findings)`
+    );
+  }
   lines.push(`coverage: ${covered}/${reviewablePaths.length} reviewable files`);
   if (validations.length > 0) {
     const passed = validations.filter((record) => record.exitCode === 0).length;
@@ -2044,43 +2852,122 @@ async function finalize(args) {
     lines.push(`BLOCKED: ${crossBatch.length} file(s) still marked cross-batch:`);
     lines.push(...crossBatch.slice(0, 10).map((p) => `  ${p}`));
   }
+  if (unchallenged.length > 0) {
+    ok = false;
+    lines.push(
+      `BLOCKED: ${unchallenged.length} finding(s) need an independent challenge at depth ${depth} (record {"challenges": [{"id", "outcome", "detail", "by"}]} with prr note --file):`
+    );
+    lines.push(
+      ...unchallenged.slice(0, 10).map((f) => `  ${f.id} ${f.severity} ${f.path}:${f.line ?? "?"}`)
+    );
+  }
+  const result = buildResult(meta, verified, ok, covered, reviewablePaths.length);
+  await store.writeResult(result);
+  lines.push(
+    `result: ${result.suggestedVerdict} \xB7 blocking ${result.blocking}` + (meta.riskTier ? ` \xB7 risk tier ${meta.riskTier.tier}` : "") + " (result.json)"
+  );
   lines.push(
     ok ? "OK: coverage complete. Render the report, then ask before posting." : "Resolve the blockers above before producing a verdict."
   );
   return { output: lines.join("\n"), ok };
 }
-function renderFindings(findings, threads) {
-  if (findings.length === 0) {
-    return "No verified findings. State this explicitly and describe any validation gaps.";
+function buildResult(meta, findings, ok, covered, total) {
+  const verified = findings.filter((f) => f.status === "verified");
+  const current = verified.filter((f) => !f.preExisting);
+  const count = (severity) => current.filter((f) => f.severity === severity).length;
+  const blocking = current.filter((f) => f.severity !== "low").length;
+  const unconfirmed = findings.filter((f) => f.status === "unconfirmed");
+  const doubtfulBlocking = unconfirmed.filter((f) => !f.preExisting && f.severity !== "low").length;
+  return {
+    tool: "prr",
+    version: TOOL_VERSION,
+    scope: meta.scope,
+    ...meta.prId !== void 0 ? { prId: meta.prId } : {},
+    ...meta.iterationId !== void 0 ? { iterationId: meta.iterationId } : {},
+    sourceSHA: meta.sourceSHA,
+    depth: meta.depth ?? "standard",
+    ok,
+    coverage: { covered, total },
+    counts: {
+      critical: count("critical"),
+      high: count("high"),
+      medium: count("medium"),
+      low: count("low"),
+      preExisting: verified.length - current.length,
+      suppressed: findings.filter((f) => f.status === "suppressed").length,
+      unconfirmed: unconfirmed.length,
+      notPublishable: findings.filter(
+        (f) => f.status === "candidate" || f.status === "unverified" || f.status === "unlocated"
+      ).length,
+      duplicate: findings.filter((f) => f.status === "duplicate").length,
+      retracted: findings.filter((f) => f.status === "retracted").length
+    },
+    blocking,
+    suggestedVerdict: !ok ? "incomplete" : blocking > 0 ? "request-changes" : doubtfulBlocking > 0 ? "needs-clarification" : "approve",
+    ...meta.riskTier ? { riskTier: meta.riskTier } : {}
+  };
+}
+function renderBlock(f) {
+  const lines = [];
+  const label = f.preExisting ? `${PRE_EXISTING_LABEL} (${SEVERITY_NAME[f.severity]})` : SEVERITY_LABEL[f.severity];
+  lines.push(`${label} \u2014 \`${f.path}\` (line ${f.line ?? "?"})`);
+  lines.push(`Problem: ${f.problem}`);
+  lines.push("Evidence:");
+  lines.push("```");
+  lines.push(f.evidence.trimEnd());
+  lines.push("```");
+  lines.push(`Fix: ${f.fix}`);
+  if (f.rationale) lines.push(`Why flagged: ${f.rationale}`);
+  if (f.verification) {
+    lines.push(`Verification (${f.verification.method}): ${f.verification.detail}`);
   }
-  const ordered = findings.slice().sort(
-    (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity) || a.path.localeCompare(b.path)
-  );
-  const blocks = ordered.map((f) => {
-    const lines = [];
-    lines.push(`${SEVERITY_LABEL[f.severity]} \u2014 \`${f.path}\` (line ${f.line ?? "?"})`);
-    lines.push(`Problem: ${f.problem}`);
-    lines.push("Evidence:");
+  if (f.challenge) lines.push(`Challenge (${f.challenge.outcome}): ${f.challenge.detail}`);
+  if (f.fixedCode) {
+    lines.push("Fixed code:");
     lines.push("```");
-    lines.push(f.evidence.trimEnd());
+    lines.push(f.fixedCode.trimEnd());
     lines.push("```");
-    lines.push(`Fix: ${f.fix}`);
-    if (f.verification) {
-      lines.push(`Verification (${f.verification.method}): ${f.verification.detail}`);
-    }
-    if (f.fixedCode) {
-      lines.push("Fixed code:");
-      lines.push("```");
-      lines.push(f.fixedCode.trimEnd());
-      lines.push("```");
-    }
-    return lines.join("\n");
-  });
+  }
+  return lines.join("\n");
+}
+function bySeverity(a, b) {
+  return SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity) || a.path.localeCompare(b.path);
+}
+function renderFindings(findings, threads) {
+  const verified = findings.filter((f) => f.status === "verified");
+  const current = verified.filter((f) => !f.preExisting).sort(bySeverity);
+  const preExisting = verified.filter((f) => f.preExisting).sort(bySeverity);
+  const unconfirmed = findings.filter((f) => f.status === "unconfirmed").sort(bySeverity);
+  const suppressed = findings.filter((f) => f.status === "suppressed").length;
+  const sections = [];
+  if (current.length === 0) {
+    sections.push(
+      "No verified findings introduced by this change. State this explicitly and describe any validation gaps."
+    );
+  } else {
+    sections.push(current.map(renderBlock).join("\n\n"));
+  }
+  if (preExisting.length > 0) {
+    sections.push(
+      "#### Pre-existing issues (not introduced by this change; never block the verdict)\n\n" + preExisting.map(renderBlock).join("\n\n")
+    );
+  }
+  if (unconfirmed.length > 0) {
+    sections.push(
+      "#### For Open Questions (independent challenge was uncertain)\n\n" + unconfirmed.map((f) => `- \`${f.path}\` line ${f.line ?? "?"} (${f.severity}): ${f.problem} \u2014 challenge: ${f.challenge?.detail ?? ""}`).join("\n")
+    );
+  }
+  const notes = [];
+  if (suppressed > 0) {
+    notes.push(`_${suppressed} verified finding(s) were suppressed by path thresholds or caps and are not listed._`);
+  }
   const covered = threads.filter((t) => !t.isBot && !t.isDeleted && t.path).length;
-  const footer = covered > 0 ? `
-_${covered} existing inline thread(s) were reconciled; duplicates are omitted above._` : "";
-  return `${blocks.join("\n\n")}
-${footer}`;
+  if (covered > 0) {
+    notes.push(`_${covered} existing inline thread(s) were reconciled; duplicates are omitted above._`);
+  }
+  return `${sections.join("\n\n")}
+${notes.length > 0 ? `
+${notes.join("\n")}` : ""}`;
 }
 
 // src/commands/post.ts
@@ -2100,30 +2987,50 @@ var SEVERITY_RANK = {
   low: 3
 };
 function commentBody(finding) {
+  const label = finding.preExisting ? `\u{1F7E3} **Pre-existing** (${SEVERITY_LABEL2[finding.severity]}) \u2014 not introduced by this pull request` : SEVERITY_LABEL2[finding.severity];
+  const evidence = finding.evidence.trimEnd();
+  const evidenceFence = fenceFor(evidence);
   const parts = [
-    `${SEVERITY_LABEL2[finding.severity]} \u2014 ${finding.problem}`,
+    `${label} \u2014 ${finding.problem}`,
     "",
     "**Evidence**",
-    "```",
-    finding.evidence.trimEnd(),
-    "```",
+    evidenceFence,
+    evidence,
+    evidenceFence,
     `**Fix** ${finding.fix}`
   ];
-  if (finding.verification) {
-    parts.push(
-      "",
-      `**Verification (${finding.verification.method})** ${finding.verification.detail}`
-    );
-  }
   if (finding.fixedCode) {
-    parts.push("", "**Suggested code**", "```", finding.fixedCode.trimEnd(), "```");
+    const code = finding.fixedCode.trimEnd();
+    const fence = fenceFor(code);
+    parts.push("", "**Suggested code**", fence, code, fence);
   }
+  const why = [];
+  if (finding.rationale) why.push(finding.rationale);
+  if (finding.challenge?.outcome === "confirmed") {
+    why.push(`Independently challenged and confirmed: ${finding.challenge.detail}`);
+  }
+  if (finding.verification) {
+    why.push(`Verified by ${finding.verification.method}: ${finding.verification.detail}`);
+  }
+  if (why.length > 0) parts.push("", `**Why this was flagged** ${why.join(" ")}`);
+  parts.push("", findingMarker(finding));
   return parts.join("\n");
+}
+function resultFooter(result) {
+  const c = result.counts;
+  return `_prr result: ${result.suggestedVerdict} \xB7 critical ${c.critical} \xB7 high ${c.high} \xB7 medium ${c.medium} \xB7 low ${c.low} \xB7 pre-existing ${c.preExisting} \xB7 suppressed ${c.suppressed}` + (result.iterationId !== void 0 ? ` \xB7 iteration ${result.iterationId}` : "") + ` \xB7 ${result.sourceSHA.slice(0, 10)}_`;
 }
 var SUMMARY_KEY = "__summary__";
 async function post(args) {
-  if (args.retract && args.retract.length > 0 && args.updateSummary) {
-    throw new Error("--retract and --update-summary are separate write actions; run them separately.");
+  const modes = [
+    args.retract && args.retract.length > 0,
+    args.updateSummary,
+    args.resolve && args.resolve.length > 0
+  ].filter(Boolean).length;
+  if (modes > 1) {
+    throw new Error(
+      "--retract, --update-summary and --resolve are separate write actions; run them separately."
+    );
   }
   const store = await RunStore.open(args.dir);
   const meta = await store.meta();
@@ -2152,10 +3059,21 @@ async function post(args) {
       saveLedger
     });
   }
+  if (args.resolve && args.resolve.length > 0) {
+    return resolveThreads({
+      args,
+      client: new AdoClient({ org, project, repo: meta.repo }),
+      store,
+      ledger,
+      prId,
+      saveLedger
+    });
+  }
   if (args.updateSummary) {
     return updateSummary({
       args,
       client: new AdoClient({ org, project, repo: meta.repo }),
+      store,
       ledger,
       prId,
       saveLedger
@@ -2170,13 +3088,19 @@ async function post(args) {
   const notPublishable = findings.filter(
     (f) => f.status !== "verified" && f.status !== "duplicate" && f.status !== "retracted"
   ).length + findings.filter((f) => f.status === "verified" && typeof f.line !== "number").length;
-  const eligible = locatable.filter((f) => SEVERITY_RANK[f.severity] <= threshold);
-  const belowThreshold = locatable.length - eligible.length;
+  const preExistingWithheld = args.includePreExisting ? 0 : locatable.filter((f) => f.preExisting).length;
+  const inScope = locatable.filter((f) => args.includePreExisting || !f.preExisting);
+  const eligible = inScope.filter((f) => SEVERITY_RANK[f.severity] <= threshold);
+  const belowThreshold = inScope.length - eligible.length;
+  const priorById = new Map((await store.readPriorFindings()).map((p) => [p.findingId, p.threadId]));
+  for (const f of eligible) {
+    if (ledger[f.id] === void 0 && priorById.has(f.id)) ledger[f.id] = priorById.get(f.id);
+  }
   const pending = eligible.filter((f) => ledger[f.id] === void 0);
   const fileByPath = new Map(files.map((f) => [f.path, f]));
   if (args.dryRun) {
     const lines2 = [
-      `dry run: ${pending.length} thread(s) would be posted to PR ${prId} (${eligible.length - pending.length} already posted, ${belowThreshold} below --min-severity, ${notPublishable} not publishable, ${terminalExcluded} duplicate/retracted)`
+      `dry run: ${pending.length} thread(s) would be posted to PR ${prId} (${eligible.length - pending.length} already posted, ${belowThreshold} below --min-severity, ${preExistingWithheld} pre-existing withheld, ${notPublishable} not publishable, ${terminalExcluded} duplicate/retracted)`
     ];
     for (const f of pending) {
       lines2.push(`  ${f.severity} ${f.path}:${f.line} [${f.id}]`);
@@ -2200,7 +3124,7 @@ async function post(args) {
   }
   let summaryLine = "";
   if (args.summaryFile) {
-    const content = await readFile5(args.summaryFile, "utf8");
+    const content = await summaryContent(args.summaryFile, store);
     if (ledger[SUMMARY_KEY] !== void 0) {
       summaryLine = `summary comment already posted as thread ${ledger[SUMMARY_KEY]} (use --update-summary to append a correction)`;
     } else {
@@ -2226,8 +3150,15 @@ async function post(args) {
       `${belowThreshold} finding(s) are below --min-severity ${args.minSeverity ?? "high"} (already excluded for no other reason; rerun with a lower threshold to include them).`
     );
   }
+  if (preExistingWithheld > 0) {
+    lines.push(
+      `${preExistingWithheld} pre-existing finding(s) were withheld (rerun with --include-pre-existing to post them).`
+    );
+  }
   if (notPublishable > 0) {
-    lines.push(`${notPublishable} finding(s) were not publishable (unverified or unlocated).`);
+    lines.push(
+      `${notPublishable} finding(s) were not publishable (unverified, unlocated, unconfirmed or suppressed).`
+    );
   }
   if (terminalExcluded > 0) {
     lines.push(`${terminalExcluded} finding(s) were terminally excluded (duplicate or retracted).`);
@@ -2337,7 +3268,7 @@ async function updateSummary(ctx) {
   if (!args.summaryFile) {
     throw new Error("--update-summary requires --summary <path.md> with the corrected text.");
   }
-  const content = await readFile5(args.summaryFile, "utf8");
+  const content = await summaryContent(args.summaryFile, ctx.store);
   const contentHash2 = summaryHash(content);
   const updateKey = `summary:${contentHash2}`;
   const threadId = ledger[SUMMARY_KEY];
@@ -2367,6 +3298,75 @@ async function updateSummary(ctx) {
 }
 function summaryHash(content) {
   return createHash3("sha256").update(content).digest("hex").slice(0, 16);
+}
+async function summaryContent(path, store) {
+  const text = (await readFile5(path, "utf8")).trimEnd();
+  const result = await store.readResult();
+  return result ? `${text}
+
+${resultFooter(result)}
+` : `${text}
+`;
+}
+async function resolveThreads(ctx) {
+  const { args, client, store, ledger, prId, saveLedger } = ctx;
+  const resolution = args.resolution ?? "fixed";
+  if (resolution !== "fixed" && resolution !== "withdrawn") {
+    throw new Error("--resolution must be fixed or withdrawn.");
+  }
+  const custom = args.messageFile ? (await readFile5(args.messageFile, "utf8")).trim() : void 0;
+  const prior = new Map((await store.readPriorFindings()).map((p) => [p.threadId, p]));
+  const meta = await store.meta();
+  const planned = [];
+  const skipped = [];
+  for (const threadId of args.resolve ?? []) {
+    const entry = prior.get(threadId);
+    if (!entry) {
+      throw new Error(
+        `--resolve: thread ${threadId} is not a prr finding thread on this pull request (see prior-findings.json). Human threads are never resolved by this tool.`
+      );
+    }
+    if (ledger[`resolved:${threadId}`] !== void 0) {
+      skipped.push(`  thread ${threadId} \u2014 already resolved by this run`);
+      continue;
+    }
+    if (!isOpenThreadStatus(entry.status)) {
+      skipped.push(`  thread ${threadId} \u2014 already ${entry.status}`);
+      continue;
+    }
+    planned.push({ threadId, findingId: entry.findingId, ...entry.path ? { path: entry.path } : {} });
+  }
+  if (args.dryRun) {
+    const lines2 = [`dry run: ${planned.length} thread(s) would be resolved as ${resolution} on PR ${prId}`];
+    for (const p of planned) lines2.push(`  thread ${p.threadId} (${p.path ?? "?"}, finding ${p.findingId})`);
+    lines2.push(...skipped);
+    return lines2.join("\n");
+  }
+  const done = [];
+  const failed = [];
+  for (const p of planned) {
+    try {
+      const text = custom ?? resolutionComment(resolution, meta);
+      await client.replyToThread(prId, p.threadId, text);
+      await client.setThreadStatus(prId, p.threadId, resolution === "fixed" ? "fixed" : "closed");
+      ledger[`resolved:${p.threadId}`] = p.threadId;
+      await saveLedger();
+      done.push(`  thread ${p.threadId} -> ${resolution === "fixed" ? "fixed" : "closed"}`);
+    } catch (err) {
+      failed.push(`  thread ${p.threadId} \u2014 ${err.message.slice(0, 160)}`);
+    }
+  }
+  const lines = [`resolved ${done.length} prr thread(s) on PR ${prId} as ${resolution}`];
+  lines.push(...done, ...skipped);
+  if (failed.length > 0) {
+    lines.push(`failed ${failed.length}:`);
+    lines.push(...failed);
+  }
+  return lines.join("\n");
+}
+function resolutionComment(resolution, meta) {
+  const where = meta.iterationId !== void 0 ? `iteration ${meta.iterationId} (${meta.sourceSHA.slice(0, 10)})` : meta.sourceSHA.slice(0, 10);
+  return resolution === "fixed" ? `\u2705 **Resolved** \u2014 re-reviewed at ${where}; the issue described above is addressed. Reopen this thread if it is not.` : `\u26A0\uFE0F **Withdrawn** \u2014 re-reviewed at ${where}; this finding does not hold and needs no change. Apologies for the noise.`;
 }
 
 // src/commands/recordExec.ts
@@ -2521,26 +3521,35 @@ var USAGE = `prr ${TOOL_VERSION} \u2014 deterministic toolkit for Azure DevOps p
 
 Usage:
   prr prepare <pr-url|pr-id> [--repo <path>] [--iteration <n>] [--since <n>]
-                             [--max-files <n>] [--max-tokens <n>] [--rule <path>]
-                             [--reset]
+                             [--depth quick|standard|deep] [--max-files <n>]
+                             [--max-tokens <n>] [--rule <path>] [--reset]
   prr prepare --branch <base-ref> [...]
   prr prepare --working-tree [...]
       Pin the revisions, triage every changed file, build risk-ordered batches
       and write one review payload per batch. Run this once per review.
       --branch reviews the current branch against its merge base with <base-ref>;
       --working-tree reviews uncommitted and untracked work against HEAD.
+      Also writes intent.md (title, description, linked work items or commit
+      messages), guidance.md (AGENTS.md / CLAUDE.md / REVIEW.md from the base
+      revision), prior-findings.json (threads posted by earlier prr runs) and a
+      suggested risk tier. Rules and guidance are always read from the base
+      revision, never from the change under review.
 
   prr note --file <path.json> [--dir <run>]
-      Record file verdicts and candidate findings from a JSON file.
+      Record file verdicts, candidate findings, independent challenges
+      ({"challenges": [...]}), duplicates ({"duplicates": [...]}), severity
+      corrections ({"reclassify": [...]}) and retractions from a JSON file.
 
   prr note --batch <n> --all-clean [--except <path>=findings|cross-batch,...]
            [--dir <run>]
       Mark every file in a reviewed batch clean, with explicit exceptions.
       Refuses to overwrite an existing different verdict.
 
-  prr finalize [--render] [--format md|sarif|json] [--dir <run>]
+  prr finalize [--render] [--format md|sarif|json|result] [--dir <run>]
       Verify every finding's evidence against the source revision, resolve its
-      line, check coverage. --render prints the findings.
+      line, apply path thresholds and caps, require independent challenges for
+      blocking findings, check coverage, and write result.json. --render prints
+      the findings; --format result prints result.json.
 
   prr context --path <p> [--start <n>] [--end <n>] [--dir <run>]
       Read a window of a file at the source revision. Defaults to 120 lines
@@ -2551,13 +3560,15 @@ Usage:
       Search the source revision for a symbol or literal. Use this instead of
       shell grep: the repository may have no checkout, only the fetched commits.
 
-  prr rules check <path> [--repo <path>] [--rule <path>]
-      Show which review rules apply to a path, and from which layer.
+  prr rules check <path> [--repo <path>] [--rule <path>] [--rev <ref>]
+      Show which review rules apply to a path, and from which layer. Reads the
+      working tree by default; --rev reads the project rule file at a revision.
 
   prr post [--min-severity critical|high|medium|low] [--summary <path.md>]
-           [--dry-run] [--dir <run>]
+           [--include-pre-existing] [--dry-run] [--dir <run>]
       Publish verified findings as inline threads. Requires explicit user
-      approval. Idempotent: a finding already posted is never posted again.
+      approval. Idempotent: a finding already posted, by this run or an earlier
+      one, is never posted again. Pre-existing findings are withheld by default.
 
   prr post --retract <id>[,<id>...] [--dry-run] [--dir <run>]
       Append a correction to each posted finding's thread and close it. The
@@ -2566,6 +3577,11 @@ Usage:
   prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
       Append a corrected summary to the existing summary thread, so stale
       counts do not stand after a retraction or a later review round.
+
+  prr post --resolve <thread-id>[,<id>...] [--resolution fixed|withdrawn]
+           [--message <path.md>] [--dry-run] [--dir <run>]
+      Reply to and resolve threads posted by earlier prr runs (listed in
+      prior-findings.json). Never touches a human reviewer's thread.
 
   prr exec --record [--timeout <seconds>] [--dir <run>] -- <command> [args...]
       Run one explicit command without a shell and append its redacted, capped
@@ -2623,7 +3639,8 @@ async function rulesCheck(positional, flags) {
   }
   const path = positional[1].replace(/^\//, "");
   const root = await repoRoot(str(flags.repo) ?? process.cwd());
-  const resolved = await loadRules(root, str(flags.rule));
+  const rev = str(flags.rev);
+  const resolved = await loadRules(root, str(flags.rule), rev ? { rev } : {});
   const lines = [`${path} @ ${root}`];
   lines.push(
     resolved.sources.length > 0 ? `rule files: ${resolved.sources.join(", ")}` : "rule files: none (built-in rules only)"
@@ -2633,6 +3650,14 @@ async function rulesCheck(positional, flags) {
     return lines.join("\n");
   }
   const applicable = rulesForPath(path, resolved);
+  const minSeverity = minSeverityForPath(path, resolved);
+  if (minSeverity) lines.push(`reporting threshold: ${minSeverity} and above`);
+  const risk = riskPathsFor(path, resolved);
+  if (risk.length > 0) {
+    lines.push(
+      `risk signals: ${risk.map((entry) => `${entry.label ?? "project"} +${entry.weight} (${entry.path})`).join(", ")}`
+    );
+  }
   if (applicable.length === 0) {
     lines.push("rules: none \u2014 reviewed against reference/standards.md only");
   } else {
@@ -2685,7 +3710,8 @@ async function main() {
           maxFiles: num(flags["max-files"]),
           maxTokens: num(flags["max-tokens"]),
           rule: str(flags.rule),
-          reset: flags.reset === true
+          reset: flags.reset === true,
+          ...str(flags.depth) ? { depth: str(flags.depth) } : {}
         })
       );
       return 0;
@@ -2713,6 +3739,13 @@ async function main() {
     }
     case "finalize": {
       const format = str(flags.format);
+      if (format === "result") {
+        const store = await RunStore.open(str(flags.dir));
+        const saved = await store.readResult();
+        if (!saved) throw new Error("No result.json yet. Run `prr finalize` first.");
+        console.log(JSON.stringify(saved, null, 2));
+        return saved.ok ? 0 : 1;
+      }
       const result = await finalize({
         dir: str(flags.dir),
         render: flags.render === true || format !== void 0,
@@ -2746,6 +3779,13 @@ async function main() {
       const severity = str(flags["min-severity"]);
       const retractFlag = flags.retract;
       const retract = typeof retractFlag === "string" ? retractFlag.split(",").map((id) => id.trim()).filter(Boolean) : void 0;
+      const resolveFlag = flags.resolve;
+      const resolve = typeof resolveFlag === "string" ? resolveFlag.split(",").map((id) => {
+        const n = Number.parseInt(id.trim(), 10);
+        if (!Number.isInteger(n) || n <= 0) throw new Error(`Invalid --resolve thread id "${id}".`);
+        return n;
+      }) : void 0;
+      const resolution = str(flags.resolution);
       console.log(
         await post({
           dir: str(flags.dir),
@@ -2753,7 +3793,11 @@ async function main() {
           dryRun: flags["dry-run"] === true,
           summaryFile: str(flags.summary),
           ...retract && retract.length > 0 ? { retract } : {},
-          updateSummary: flags["update-summary"] === true
+          updateSummary: flags["update-summary"] === true,
+          includePreExisting: flags["include-pre-existing"] === true,
+          ...resolve && resolve.length > 0 ? { resolve } : {},
+          ...resolution ? { resolution } : {},
+          ...str(flags.message) ? { messageFile: str(flags.message) } : {}
         })
       );
       return 0;

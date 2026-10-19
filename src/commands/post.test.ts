@@ -199,3 +199,148 @@ test("a newly posted summary records its content hash for later update deduplica
   assert.match(second, /already posted/);
   assert.equal(calls, 0);
 });
+
+function verifiedFinding(overrides: Partial<Finding> = {}): Finding {
+  return {
+    id: "feedface0001",
+    path: "src/app.ts",
+    line: 7,
+    severity: "high",
+    category: "bug",
+    problem: "A real defect.",
+    evidence: "client.method()",
+    fix: "Fix it.",
+    status: "verified",
+    batch: 1,
+    createdAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+test("pre-existing findings are withheld unless explicitly included", async (t) => {
+  const { dir, cleanup } = await buildAdoRun(verifiedFinding({ preExisting: true }));
+  t.after(() => cleanup());
+
+  const withheld = await post({ dir, dryRun: true, minSeverity: "low" });
+  assert.match(withheld, /0 thread\(s\) would be posted/);
+  assert.match(withheld, /1 pre-existing withheld/);
+
+  const included = await post({ dir, dryRun: true, minSeverity: "low", includePreExisting: true });
+  assert.match(included, /1 thread\(s\) would be posted/);
+});
+
+test("a finding already posted by an earlier run's thread is not posted again", async (t) => {
+  const finding = verifiedFinding();
+  const { dir, cleanup } = await buildAdoRun(finding);
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.writePriorFindings([
+    { threadId: 501, findingId: finding.id, status: "active", evidenceStillPresent: true, replies: [] },
+  ]);
+
+  const output = await post({ dir, dryRun: true });
+  assert.match(output, /0 thread\(s\) would be posted/);
+  assert.match(output, /1 already posted/);
+});
+
+test("post --resolve replies to and resolves only prr threads, idempotently", async (t) => {
+  const { dir, cleanup } = await buildAdoRun();
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.writePriorFindings([
+    { threadId: 601, findingId: "aaaa1111bbbb", path: "src/app.ts", status: "active", evidenceStillPresent: false, replies: [] },
+    { threadId: 602, findingId: "cccc2222dddd", status: "fixed", evidenceStillPresent: false, replies: [] },
+  ]);
+
+  await assert.rejects(() => post({ dir, resolve: [999] }), /not a prr finding thread/);
+
+  const dry = await post({ dir, resolve: [601, 602], dryRun: true });
+  assert.match(dry, /1 thread\(s\) would be resolved as fixed/);
+  assert.match(dry, /thread 602 — already fixed/);
+
+  const calls: { url: string; method: string; body: unknown }[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    calls.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+    });
+    return jsonResponse({ id: 1 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const done = await post({ dir, resolve: [601], resolution: "withdrawn" });
+  assert.match(done, /thread 601 -> closed/);
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].url, /threads\/601\/comments/);
+  assert.match(String((calls[0].body as { content: string }).content), /Withdrawn/);
+  assert.deepEqual(calls[1].body, { status: "closed" });
+
+  calls.length = 0;
+  const again = await post({ dir, resolve: [601] });
+  assert.match(again, /already resolved by this run/);
+  assert.equal(calls.length, 0);
+});
+
+test("the posted summary carries a machine-readable result line from result.json", async (t) => {
+  const { dir, cleanup } = await buildAdoRun();
+  t.after(() => cleanup());
+  const store = await RunStore.open(dir);
+  await store.writeResult({
+    tool: "prr",
+    version: "test",
+    scope: "ado-pr",
+    prId: 42,
+    iterationId: 3,
+    sourceSHA: "a".repeat(40),
+    depth: "standard",
+    ok: true,
+    coverage: { covered: 1, total: 1 },
+    counts: {
+      critical: 0,
+      high: 1,
+      medium: 0,
+      low: 0,
+      preExisting: 2,
+      suppressed: 1,
+      unconfirmed: 0,
+      notPublishable: 0,
+      duplicate: 0,
+      retracted: 0,
+    },
+    blocking: 1,
+    suggestedVerdict: "request-changes",
+  });
+  const summary = join(dir, "summary.md");
+  await writeFile(summary, "## Summary\n\nOne High finding.\n", "utf8");
+
+  const bodies: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as { comments: { content: string }[] };
+    bodies.push(body.comments[0].content);
+    return jsonResponse({ id: 90 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await post({ dir, summaryFile: summary });
+  assert.equal(bodies.length, 1);
+  assert.match(
+    bodies[0],
+    /_prr result: request-changes · critical 0 · high 1 · medium 0 · low 0 · pre-existing 2 · suppressed 1 · iteration 3 · aaaaaaaaaa_\n$/,
+  );
+});
+
+test("posting rejects combining resolve with another write", async (t) => {
+  const { dir, cleanup } = await buildAdoRun();
+  t.after(() => cleanup());
+  await assert.rejects(
+    () => post({ dir, resolve: [1], updateSummary: true, summaryFile: "x.md" }),
+    /separate write actions/,
+  );
+});

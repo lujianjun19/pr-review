@@ -6,6 +6,7 @@ import {
   VERIFICATION_METHODS,
 } from "../core/findingVerification.ts";
 import type {
+  ChallengeOutcome,
   FileVerdict,
   Finding,
   FindingVerification,
@@ -17,6 +18,7 @@ import type {
 
 const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 const VERDICTS: VerdictValue[] = ["clean", "findings", "cross-batch"];
+const CHALLENGE_OUTCOMES: ChallengeOutcome[] = ["confirmed", "refuted", "uncertain"];
 
 function fail(message: string): never {
   throw new Error(message);
@@ -98,6 +100,10 @@ function validateFinding(raw: Partial<Finding>, index: number, knownPaths: Set<s
     evidence: raw.evidence!,
     fix: raw.fix!.trim(),
     fixedCode: raw.fixedCode,
+    ...(raw.preExisting === true ? { preExisting: true } : {}),
+    ...(typeof raw.rationale === "string" && raw.rationale.trim()
+      ? { rationale: raw.rationale.trim() }
+      : {}),
     status: "candidate",
     ...(verification ? { verification } : {}),
     batch: raw.batch,
@@ -240,13 +246,16 @@ export async function note(args: NoteArgs): Promise<string> {
   await store.appendVerdicts(verdicts);
   await store.appendFindings(fresh);
 
+  const corrected = await applyCorrections(store, input);
+  const challenged = await applyChallenges(store, input, await store.readFindings());
+
   const retractIds = input.retract ?? [];
   let retracted = 0;
   if (retractIds.length > 0) {
     // Retraction rewrites in place rather than appending: a retracted finding
     // must disappear from the postable set, not merely gain a second, later
     // record that a reader could still mistake for current.
-    const all = [...existing, ...fresh];
+    const all = await store.readFindings();
     const byId = new Map(all.map((f) => [f.id, f]));
     for (const id of retractIds) {
       if (!byId.has(id)) {
@@ -267,7 +276,13 @@ export async function note(args: NoteArgs): Promise<string> {
   const lines = [
     `recorded ${verdicts.length} verdict(s), ${fresh.length} finding(s)` +
       (duplicates > 0 ? ` (${duplicates} already recorded, ignored)` : "") +
-      (retracted > 0 ? `, ${retracted} finding(s) retracted` : ""),
+      (retracted > 0 ? `, ${retracted} finding(s) retracted` : "") +
+      (corrected.duplicates > 0 ? `, ${corrected.duplicates} marked duplicate` : "") +
+      (corrected.reclassified > 0 ? `, ${corrected.reclassified} reclassified` : "") +
+      (challenged.total > 0
+        ? `, ${challenged.total} challenge(s): ${challenged.confirmed} confirmed, ` +
+          `${challenged.refuted} refuted (retracted), ${challenged.uncertain} uncertain`
+        : ""),
   ];
   if (fresh.length > 0) {
     lines.push(`  severities: ${[...bySeverity].map(([s, n]) => `${s} x${n}`).join(", ")}`);
@@ -276,4 +291,96 @@ export async function note(args: NoteArgs): Promise<string> {
   const covered = [...reviewable].filter((path) => done.has(path)).length;
   lines.push(`coverage: ${covered}/${reviewable.size} reviewable files have a verdict`);
   return lines.join("\n");
+}
+
+/**
+ * Records independent challenge results.
+ *
+ * A refuted finding is retracted on the spot: the challenger is the review's own
+ * second opinion, and a claim that did not survive it must not reach the
+ * author. An uncertain one stays recorded; finalize routes it to Open
+ * Questions. A retracted or duplicate finding is terminal and cannot be
+ * re-challenged back into play.
+ */
+async function applyChallenges(
+  store: RunStore,
+  input: NoteInput,
+  all: Finding[],
+): Promise<{ total: number; confirmed: number; refuted: number; uncertain: number }> {
+  const entries = input.challenges ?? [];
+  const tally = { total: 0, confirmed: 0, refuted: 0, uncertain: 0 };
+  if (entries.length === 0) return tally;
+
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const now = new Date().toISOString();
+  for (const [index, entry] of entries.entries()) {
+    const where = `challenges[${index}]`;
+    const finding = byId.get(entry?.id);
+    if (!finding) fail(`${where}: "${entry?.id}" is not a recorded finding id.`);
+    if (!CHALLENGE_OUTCOMES.includes(entry.outcome)) {
+      fail(`${where}: "outcome" must be one of ${CHALLENGE_OUTCOMES.join(", ")}.`);
+    }
+    const detail = (entry.detail ?? "").trim();
+    if (!detail) fail(`${where}: "detail" is required — say what was checked.`);
+    if (finding.status === "retracted" || finding.status === "duplicate") {
+      fail(`${where}: finding ${finding.id} is ${finding.status}, which is terminal.`);
+    }
+    const challenge = { outcome: entry.outcome, detail, by: entry.by?.trim() || "unspecified", at: now };
+    byId.set(
+      finding.id,
+      entry.outcome === "refuted"
+        ? { ...finding, challenge, status: "retracted", retractReason: detail }
+        : { ...finding, challenge },
+    );
+    tally.total++;
+    tally[entry.outcome]++;
+  }
+  await store.replaceFindings(all.map((f) => byId.get(f.id)!));
+  return tally;
+}
+
+/**
+ * Marks duplicates and corrects severities on already-recorded findings.
+ *
+ * Re-noting a finding cannot do either: its fingerprint is unchanged, so the
+ * second record is ignored as already present. These are explicit edits keyed
+ * by id instead. Terminal findings are left alone.
+ */
+async function applyCorrections(
+  store: RunStore,
+  input: NoteInput,
+): Promise<{ duplicates: number; reclassified: number }> {
+  const duplicates = input.duplicates ?? [];
+  const reclassify = input.reclassify ?? [];
+  if (duplicates.length === 0 && reclassify.length === 0) return { duplicates: 0, reclassified: 0 };
+
+  const all = await store.readFindings();
+  const byId = new Map(all.map((f) => [f.id, f]));
+  const editable = (id: string, where: string): Finding => {
+    const finding = byId.get(id);
+    if (!finding) fail(`${where}: "${id}" is not a recorded finding id.`);
+    if (finding.status === "retracted" || finding.status === "duplicate") {
+      fail(`${where}: finding ${id} is ${finding.status}, which is terminal.`);
+    }
+    return finding;
+  };
+
+  for (const [index, entry] of duplicates.entries()) {
+    const where = `duplicates[${index}]`;
+    const finding = editable(entry?.id, where);
+    if (!Number.isInteger(entry.thread) || entry.thread <= 0) {
+      fail(`${where}: "thread" must be the id of the existing thread that covers it.`);
+    }
+    byId.set(finding.id, { ...finding, status: "duplicate", dupOfThread: entry.thread });
+  }
+  for (const [index, entry] of reclassify.entries()) {
+    const where = `reclassify[${index}]`;
+    const finding = editable(entry?.id, where);
+    if (!SEVERITIES.includes(entry.severity)) {
+      fail(`${where}: "severity" must be one of ${SEVERITIES.join(", ")}.`);
+    }
+    byId.set(finding.id, { ...byId.get(finding.id)!, severity: entry.severity });
+  }
+  await store.replaceFindings(all.map((f) => byId.get(f.id)!));
+  return { duplicates: duplicates.length, reclassified: reclassify.length };
 }

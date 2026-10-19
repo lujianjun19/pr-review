@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { matchesGlob } from "./glob.ts";
 import { loadRules, rulesForPath, isExcludedByRules } from "./rules.ts";
 
+// Isolate from the developer's own ~/.config/pr-review/rules.json, which loadRules reads as the
+// user layer: a test must not pass or fail depending on the machine it runs on.
+process.env.XDG_CONFIG_HOME = join(tmpdir(), "prr-test-config-does-not-exist");
+
 test("matchesGlob handles the patterns rules are written with", () => {
   assert.ok(matchesGlob("src/app/user.ts", "**/*.ts"));
   assert.ok(matchesGlob("user.ts", "**/*.ts"));

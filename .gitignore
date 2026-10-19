@@ -9,3 +9,6 @@ Thumbs.db
 !.env.example
 .idea/
 .vscode/*.local.json
+
+# Private deny-list for scripts/check-public-safety.mjs; keep it outside the repository.
+private-terms.txt

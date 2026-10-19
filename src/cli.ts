@@ -5,9 +5,9 @@ import { post } from "./commands/post.ts";
 import { recordExec } from "./commands/recordExec.ts";
 import { RunStore } from "./core/store.ts";
 import { showFile, grepAtRev, repoRoot } from "./core/git.ts";
-import { loadRules, rulesForPath, isExcludedByRules } from "./core/rules.ts";
+import { loadRules, rulesForPath, isExcludedByRules, minSeverityForPath, riskPathsFor } from "./core/rules.ts";
 import { TOOL_VERSION } from "./version.ts";
-import type { VerdictValue } from "./types.ts";
+import type { ReviewDepth, VerdictValue } from "./types.ts";
 
 interface ParsedArgs {
   positional: string[];
@@ -78,26 +78,35 @@ const USAGE = `prr ${TOOL_VERSION} — deterministic toolkit for Azure DevOps pu
 
 Usage:
   prr prepare <pr-url|pr-id> [--repo <path>] [--iteration <n>] [--since <n>]
-                             [--max-files <n>] [--max-tokens <n>] [--rule <path>]
-                             [--reset]
+                             [--depth quick|standard|deep] [--max-files <n>]
+                             [--max-tokens <n>] [--rule <path>] [--reset]
   prr prepare --branch <base-ref> [...]
   prr prepare --working-tree [...]
       Pin the revisions, triage every changed file, build risk-ordered batches
       and write one review payload per batch. Run this once per review.
       --branch reviews the current branch against its merge base with <base-ref>;
       --working-tree reviews uncommitted and untracked work against HEAD.
+      Also writes intent.md (title, description, linked work items or commit
+      messages), guidance.md (AGENTS.md / CLAUDE.md / REVIEW.md from the base
+      revision), prior-findings.json (threads posted by earlier prr runs) and a
+      suggested risk tier. Rules and guidance are always read from the base
+      revision, never from the change under review.
 
   prr note --file <path.json> [--dir <run>]
-      Record file verdicts and candidate findings from a JSON file.
+      Record file verdicts, candidate findings, independent challenges
+      ({"challenges": [...]}), duplicates ({"duplicates": [...]}), severity
+      corrections ({"reclassify": [...]}) and retractions from a JSON file.
 
   prr note --batch <n> --all-clean [--except <path>=findings|cross-batch,...]
            [--dir <run>]
       Mark every file in a reviewed batch clean, with explicit exceptions.
       Refuses to overwrite an existing different verdict.
 
-  prr finalize [--render] [--format md|sarif|json] [--dir <run>]
+  prr finalize [--render] [--format md|sarif|json|result] [--dir <run>]
       Verify every finding's evidence against the source revision, resolve its
-      line, check coverage. --render prints the findings.
+      line, apply path thresholds and caps, require independent challenges for
+      blocking findings, check coverage, and write result.json. --render prints
+      the findings; --format result prints result.json.
 
   prr context --path <p> [--start <n>] [--end <n>] [--dir <run>]
       Read a window of a file at the source revision. Defaults to 120 lines
@@ -108,13 +117,15 @@ Usage:
       Search the source revision for a symbol or literal. Use this instead of
       shell grep: the repository may have no checkout, only the fetched commits.
 
-  prr rules check <path> [--repo <path>] [--rule <path>]
-      Show which review rules apply to a path, and from which layer.
+  prr rules check <path> [--repo <path>] [--rule <path>] [--rev <ref>]
+      Show which review rules apply to a path, and from which layer. Reads the
+      working tree by default; --rev reads the project rule file at a revision.
 
   prr post [--min-severity critical|high|medium|low] [--summary <path.md>]
-           [--dry-run] [--dir <run>]
+           [--include-pre-existing] [--dry-run] [--dir <run>]
       Publish verified findings as inline threads. Requires explicit user
-      approval. Idempotent: a finding already posted is never posted again.
+      approval. Idempotent: a finding already posted, by this run or an earlier
+      one, is never posted again. Pre-existing findings are withheld by default.
 
   prr post --retract <id>[,<id>...] [--dry-run] [--dir <run>]
       Append a correction to each posted finding's thread and close it. The
@@ -123,6 +134,11 @@ Usage:
   prr post --update-summary --summary <path.md> [--dry-run] [--dir <run>]
       Append a corrected summary to the existing summary thread, so stale
       counts do not stand after a retraction or a later review round.
+
+  prr post --resolve <thread-id>[,<id>...] [--resolution fixed|withdrawn]
+           [--message <path.md>] [--dry-run] [--dir <run>]
+      Reply to and resolve threads posted by earlier prr runs (listed in
+      prior-findings.json). Never touches a human reviewer's thread.
 
   prr exec --record [--timeout <seconds>] [--dir <run>] -- <command> [args...]
       Run one explicit command without a shell and append its redacted, capped
@@ -204,7 +220,8 @@ async function rulesCheck(
   }
   const path = positional[1].replace(/^\//, "");
   const root = await repoRoot(str(flags.repo) ?? process.cwd());
-  const resolved = await loadRules(root, str(flags.rule));
+  const rev = str(flags.rev);
+  const resolved = await loadRules(root, str(flags.rule), rev ? { rev } : {});
 
   const lines = [`${path} @ ${root}`];
   lines.push(
@@ -217,6 +234,14 @@ async function rulesCheck(
     return lines.join("\n");
   }
   const applicable = rulesForPath(path, resolved);
+  const minSeverity = minSeverityForPath(path, resolved);
+  if (minSeverity) lines.push(`reporting threshold: ${minSeverity} and above`);
+  const risk = riskPathsFor(path, resolved);
+  if (risk.length > 0) {
+    lines.push(
+      `risk signals: ${risk.map((entry) => `${entry.label ?? "project"} +${entry.weight} (${entry.path})`).join(", ")}`,
+    );
+  }
   if (applicable.length === 0) {
     lines.push("rules: none — reviewed against reference/standards.md only");
   } else {
@@ -275,6 +300,7 @@ async function main(): Promise<number> {
           maxTokens: num(flags["max-tokens"]),
           rule: str(flags.rule),
           reset: flags.reset === true,
+          ...(str(flags.depth) ? { depth: str(flags.depth) as ReviewDepth } : {}),
         }),
       );
       return 0;
@@ -301,7 +327,14 @@ async function main(): Promise<number> {
       return 0;
     }
     case "finalize": {
-      const format = str(flags.format) as "md" | "sarif" | "json" | undefined;
+      const format = str(flags.format) as "md" | "sarif" | "json" | "result" | undefined;
+      if (format === "result") {
+        const store = await RunStore.open(str(flags.dir));
+        const saved = await store.readResult();
+        if (!saved) throw new Error("No result.json yet. Run `prr finalize` first.");
+        console.log(JSON.stringify(saved, null, 2));
+        return saved.ok ? 0 : 1;
+      }
       const result = await finalize({
         dir: str(flags.dir),
         render: flags.render === true || format !== undefined,
@@ -343,6 +376,16 @@ async function main(): Promise<number> {
         typeof retractFlag === "string"
           ? retractFlag.split(",").map((id) => id.trim()).filter(Boolean)
           : undefined;
+      const resolveFlag = flags.resolve;
+      const resolve =
+        typeof resolveFlag === "string"
+          ? resolveFlag.split(",").map((id) => {
+              const n = Number.parseInt(id.trim(), 10);
+              if (!Number.isInteger(n) || n <= 0) throw new Error(`Invalid --resolve thread id "${id}".`);
+              return n;
+            })
+          : undefined;
+      const resolution = str(flags.resolution) as "fixed" | "withdrawn" | undefined;
       console.log(
         await post({
           dir: str(flags.dir),
@@ -351,6 +394,10 @@ async function main(): Promise<number> {
           summaryFile: str(flags.summary),
           ...(retract && retract.length > 0 ? { retract } : {}),
           updateSummary: flags["update-summary"] === true,
+          includePreExisting: flags["include-pre-existing"] === true,
+          ...(resolve && resolve.length > 0 ? { resolve } : {}),
+          ...(resolution ? { resolution } : {}),
+          ...(str(flags.message) ? { messageFile: str(flags.message) } : {}),
         }),
       );
       return 0;

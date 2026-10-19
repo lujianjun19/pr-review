@@ -60,3 +60,40 @@ test("ADO client builds the policy artifact id with the project id and PR id", a
   );
   assert.equal(url.searchParams.get("api-version"), "7.1-preview.1");
 });
+
+test("ADO client reads linked work items and omits inaccessible ones", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+    if (url.includes("/workitems?ids=")) {
+      return response({
+        value: [
+          { id: 101, fields: { "System.Title": "Block empty checkout", "System.WorkItemType": "User Story" } },
+          null,
+        ],
+      });
+    }
+    return response({ value: [{ id: "101", url: "x" }, { id: "102", url: "y" }] });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const client = new AdoClient({ org: "contoso", project: "Operations Platform", repo: "portal-api" });
+  const ids = await client.listPullRequestWorkItemIds(42);
+  assert.deepEqual(ids, [101, 102]);
+  assert.match(urls[0], /repositories\/portal-api\/pullRequests\/42\/workitems\?api-version=7\.1/);
+
+  const items = await client.getWorkItems(ids);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].fields?.["System.Title"], "Block empty checkout");
+  const url = new URL(urls[1]);
+  assert.equal(url.pathname, "/contoso/Operations%20Platform/_apis/wit/workitems");
+  assert.equal(url.searchParams.get("ids"), "101,102");
+  assert.equal(url.searchParams.get("errorPolicy"), "Omit");
+  assert.match(url.searchParams.get("fields") ?? "", /Microsoft\.VSTS\.Common\.AcceptanceCriteria/);
+
+  assert.deepEqual(await client.getWorkItems([]), []);
+});

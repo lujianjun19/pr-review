@@ -30,7 +30,7 @@ async function buildRun(): Promise<{ dir: string; cleanup: () => Promise<void> }
 test("recordExec records argv, exit status and redacted output", async (t) => {
   const { dir, cleanup } = await buildRun();
   const oldToken = process.env.GITHUB_TOKEN;
-  process.env.GITHUB_TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+  process.env.GITHUB_TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz123456"; // public-safety: allow (synthetic token for the redaction test)
   t.after(async () => {
     if (oldToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = oldToken;

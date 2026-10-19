@@ -39,9 +39,23 @@ and type checking; the committed `bin/prr.mjs` is what users execute.
   posting gates, and output formats as applicable.
 - Keep source comments in English.
 - Do not place private organization names, real repositories, real pull request URLs, customer data,
-  local paths, or credentials in source, tests, fixtures, or documentation.
+  names of real people, local paths, or credentials in source, tests, fixtures, or documentation.
 - Use synthetic fixture names and temporary repositories for integration tests.
 - Preserve read-only behavior unless a write operation has an explicit CLI gate and tests.
+
+## Public-safety check (required before every commit)
+
+Enable the pre-commit hook once per clone, and keep your private terms outside the repository:
+
+```bash
+git config core.hooksPath .githooks
+mkdir -p ~/.config/pr-review
+$EDITOR ~/.config/pr-review/private-terms.txt   # one term or /regex/ per line: org, project, customer, people
+```
+
+The hook runs `npm run precommit:check` on the staged content and blocks the commit on any secret,
+personal path, real email, non-synthetic Azure DevOps organization, unknown GUID, or private term.
+Run `npm run check:public` to scan the whole working tree. Do not bypass the hook with `--no-verify`.
 
 ## Generated artifact
 

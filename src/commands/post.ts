@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 import { AdoClient } from "../ado/client.ts";
 import { RunStore } from "../core/store.ts";
 import { showFile } from "../core/git.ts";
-import type { ChangedFile, Finding, RunMeta, Severity } from "../types.ts";
+import { fenceFor, findingMarker, isOpenThreadStatus } from "../core/priorFindings.ts";
+import type { ChangedFile, Finding, ReviewResult, RunMeta, Severity } from "../types.ts";
 
 const SEVERITY_LABEL: Record<Severity, string> = {
   critical: "🔴 **Critical**",
@@ -27,26 +28,50 @@ const SEVERITY_RANK: Record<Severity, number> = {
  * here and travels to Azure DevOps inside a JSON request body. Nothing passes
  * through a shell, which is what used to mangle these characters.
  */
-function commentBody(finding: Finding): string {
+export function commentBody(finding: Finding): string {
+  const label = finding.preExisting
+    ? `🟣 **Pre-existing** (${SEVERITY_LABEL[finding.severity]}) — not introduced by this pull request`
+    : SEVERITY_LABEL[finding.severity];
+  const evidence = finding.evidence.trimEnd();
+  const evidenceFence = fenceFor(evidence);
   const parts = [
-    `${SEVERITY_LABEL[finding.severity]} — ${finding.problem}`,
+    `${label} — ${finding.problem}`,
     "",
     "**Evidence**",
-    "```",
-    finding.evidence.trimEnd(),
-    "```",
+    evidenceFence,
+    evidence,
+    evidenceFence,
     `**Fix** ${finding.fix}`,
   ];
-  if (finding.verification) {
-    parts.push(
-      "",
-      `**Verification (${finding.verification.method})** ${finding.verification.detail}`,
-    );
-  }
   if (finding.fixedCode) {
-    parts.push("", "**Suggested code**", "```", finding.fixedCode.trimEnd(), "```");
+    const code = finding.fixedCode.trimEnd();
+    const fence = fenceFor(code);
+    parts.push("", "**Suggested code**", fence, code, fence);
   }
+  // Collapsible sections are not documented for pull request comments, so the
+  // reasoning is a short plain section placed after the actionable part.
+  const why: string[] = [];
+  if (finding.rationale) why.push(finding.rationale);
+  if (finding.challenge?.outcome === "confirmed") {
+    why.push(`Independently challenged and confirmed: ${finding.challenge.detail}`);
+  }
+  if (finding.verification) {
+    why.push(`Verified by ${finding.verification.method}: ${finding.verification.detail}`);
+  }
+  if (why.length > 0) parts.push("", `**Why this was flagged** ${why.join(" ")}`);
+  parts.push("", findingMarker(finding));
   return parts.join("\n");
+}
+
+/** One-line, parseable outcome appended to the posted summary. */
+export function resultFooter(result: ReviewResult): string {
+  const c = result.counts;
+  return (
+    `_prr result: ${result.suggestedVerdict} · critical ${c.critical} · high ${c.high} · ` +
+    `medium ${c.medium} · low ${c.low} · pre-existing ${c.preExisting} · suppressed ${c.suppressed}` +
+    (result.iterationId !== undefined ? ` · iteration ${result.iterationId}` : "") +
+    ` · ${result.sourceSHA.slice(0, 10)}_`
+  );
 }
 
 interface PostedLedger {
@@ -63,6 +88,14 @@ export interface PostArgs {
   retract?: string[];
   /** Re-render the summary as a correction reply on the existing summary thread. */
   updateSummary?: boolean;
+  /** Publish pre-existing findings too; they are withheld by default. */
+  includePreExisting?: boolean;
+  /** Threads from earlier prr runs to resolve. */
+  resolve?: number[];
+  /** How the resolved threads are closed. */
+  resolution?: "fixed" | "withdrawn";
+  /** Optional markdown reply posted on each resolved thread instead of the default text. */
+  messageFile?: string;
 }
 
 const SUMMARY_KEY = "__summary__";
@@ -77,8 +110,15 @@ const SUMMARY_KEY = "__summary__";
  * else's pull request.
  */
 export async function post(args: PostArgs): Promise<string> {
-  if (args.retract && args.retract.length > 0 && args.updateSummary) {
-    throw new Error("--retract and --update-summary are separate write actions; run them separately.");
+  const modes = [
+    args.retract && args.retract.length > 0,
+    args.updateSummary,
+    args.resolve && args.resolve.length > 0,
+  ].filter(Boolean).length;
+  if (modes > 1) {
+    throw new Error(
+      "--retract, --update-summary and --resolve are separate write actions; run them separately.",
+    );
   }
 
   const store = await RunStore.open(args.dir);
@@ -118,10 +158,22 @@ export async function post(args: PostArgs): Promise<string> {
     });
   }
 
+  if (args.resolve && args.resolve.length > 0) {
+    return resolveThreads({
+      args,
+      client: new AdoClient({ org, project, repo: meta.repo }),
+      store,
+      ledger,
+      prId,
+      saveLedger,
+    });
+  }
+
   if (args.updateSummary) {
     return updateSummary({
       args,
       client: new AdoClient({ org, project, repo: meta.repo }),
+      store,
       ledger,
       prId,
       saveLedger,
@@ -144,8 +196,20 @@ export async function post(args: PostArgs): Promise<string> {
       f.status !== "duplicate" &&
       f.status !== "retracted",
   ).length + findings.filter((f) => f.status === "verified" && typeof f.line !== "number").length;
-  const eligible = locatable.filter((f) => SEVERITY_RANK[f.severity] <= threshold);
-  const belowThreshold = locatable.length - eligible.length;
+  const preExistingWithheld = args.includePreExisting
+    ? 0
+    : locatable.filter((f) => f.preExisting).length;
+  const inScope = locatable.filter((f) => args.includePreExisting || !f.preExisting);
+  const eligible = inScope.filter((f) => SEVERITY_RANK[f.severity] <= threshold);
+  const belowThreshold = inScope.length - eligible.length;
+
+  // A finding with the same fingerprint may already sit in a thread posted by an
+  // earlier run over a previous iteration. The ledger of that run is gone, but
+  // the footer in the thread is not.
+  const priorById = new Map((await store.readPriorFindings()).map((p) => [p.findingId, p.threadId]));
+  for (const f of eligible) {
+    if (ledger[f.id] === undefined && priorById.has(f.id)) ledger[f.id] = priorById.get(f.id)!;
+  }
   const pending = eligible.filter((f) => ledger[f.id] === undefined);
 
   const fileByPath = new Map(files.map((f) => [f.path, f]));
@@ -154,6 +218,7 @@ export async function post(args: PostArgs): Promise<string> {
     const lines = [
       `dry run: ${pending.length} thread(s) would be posted to PR ${prId}` +
         ` (${eligible.length - pending.length} already posted, ${belowThreshold} below --min-severity, ` +
+        `${preExistingWithheld} pre-existing withheld, ` +
         `${notPublishable} not publishable, ${terminalExcluded} duplicate/retracted)`,
     ];
     for (const f of pending) {
@@ -181,7 +246,7 @@ export async function post(args: PostArgs): Promise<string> {
 
   let summaryLine = "";
   if (args.summaryFile) {
-    const content = await readFile(args.summaryFile, "utf8");
+    const content = await summaryContent(args.summaryFile, store);
     if (ledger[SUMMARY_KEY] !== undefined) {
       summaryLine =
         `summary comment already posted as thread ${ledger[SUMMARY_KEY]} ` +
@@ -211,8 +276,15 @@ export async function post(args: PostArgs): Promise<string> {
         `(already excluded for no other reason; rerun with a lower threshold to include them).`,
     );
   }
+  if (preExistingWithheld > 0) {
+    lines.push(
+      `${preExistingWithheld} pre-existing finding(s) were withheld (rerun with --include-pre-existing to post them).`,
+    );
+  }
   if (notPublishable > 0) {
-    lines.push(`${notPublishable} finding(s) were not publishable (unverified or unlocated).`);
+    lines.push(
+      `${notPublishable} finding(s) were not publishable (unverified, unlocated, unconfirmed or suppressed).`,
+    );
   }
   if (terminalExcluded > 0) {
     lines.push(`${terminalExcluded} finding(s) were terminally excluded (duplicate or retracted).`);
@@ -361,6 +433,7 @@ function retractionComment(finding: Finding): string {
 interface SummaryContext {
   args: PostArgs;
   client: AdoClient;
+  store: RunStore;
   ledger: PostedLedger;
   prId: number;
   saveLedger: () => Promise<void>;
@@ -378,7 +451,7 @@ async function updateSummary(ctx: SummaryContext): Promise<string> {
   if (!args.summaryFile) {
     throw new Error("--update-summary requires --summary <path.md> with the corrected text.");
   }
-  const content = await readFile(args.summaryFile, "utf8");
+  const content = await summaryContent(args.summaryFile, ctx.store);
   const contentHash = summaryHash(content);
   const updateKey = `summary:${contentHash}`;
   const threadId = ledger[SUMMARY_KEY];
@@ -414,4 +487,105 @@ async function updateSummary(ctx: SummaryContext): Promise<string> {
 
 function summaryHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+/**
+ * Reads the summary text and appends the machine-readable result line.
+ *
+ * The line is generated from result.json rather than written by the reviewer,
+ * so a pipeline reading it gets the same counts finalize computed.
+ */
+async function summaryContent(path: string, store: RunStore): Promise<string> {
+  const text = (await readFile(path, "utf8")).trimEnd();
+  const result = await store.readResult();
+  return result ? `${text}\n\n${resultFooter(result)}\n` : `${text}\n`;
+}
+
+interface ResolveContext {
+  args: PostArgs;
+  client: AdoClient;
+  store: RunStore;
+  ledger: PostedLedger;
+  prId: number;
+  saveLedger: () => Promise<void>;
+}
+
+/**
+ * Resolves threads that earlier prr runs posted.
+ *
+ * Only threads recognized as prr findings can be resolved, so this can never
+ * close a human reviewer's thread. "fixed" says the author addressed it;
+ * "withdrawn" says the finding was wrong. Either way a reply explains the
+ * change of status, because a thread that silently closes looks like it was
+ * dismissed rather than settled.
+ */
+async function resolveThreads(ctx: ResolveContext): Promise<string> {
+  const { args, client, store, ledger, prId, saveLedger } = ctx;
+  const resolution = args.resolution ?? "fixed";
+  if (resolution !== "fixed" && resolution !== "withdrawn") {
+    throw new Error("--resolution must be fixed or withdrawn.");
+  }
+  const custom = args.messageFile ? (await readFile(args.messageFile, "utf8")).trim() : undefined;
+  const prior = new Map((await store.readPriorFindings()).map((p) => [p.threadId, p]));
+  const meta = await store.meta();
+
+  const planned: { threadId: number; findingId: string; path?: string }[] = [];
+  const skipped: string[] = [];
+  for (const threadId of args.resolve ?? []) {
+    const entry = prior.get(threadId);
+    if (!entry) {
+      throw new Error(
+        `--resolve: thread ${threadId} is not a prr finding thread on this pull request ` +
+          `(see prior-findings.json). Human threads are never resolved by this tool.`,
+      );
+    }
+    if (ledger[`resolved:${threadId}`] !== undefined) {
+      skipped.push(`  thread ${threadId} — already resolved by this run`);
+      continue;
+    }
+    if (!isOpenThreadStatus(entry.status)) {
+      skipped.push(`  thread ${threadId} — already ${entry.status}`);
+      continue;
+    }
+    planned.push({ threadId, findingId: entry.findingId, ...(entry.path ? { path: entry.path } : {}) });
+  }
+
+  if (args.dryRun) {
+    const lines = [`dry run: ${planned.length} thread(s) would be resolved as ${resolution} on PR ${prId}`];
+    for (const p of planned) lines.push(`  thread ${p.threadId} (${p.path ?? "?"}, finding ${p.findingId})`);
+    lines.push(...skipped);
+    return lines.join("\n");
+  }
+
+  const done: string[] = [];
+  const failed: string[] = [];
+  for (const p of planned) {
+    try {
+      const text = custom ?? resolutionComment(resolution, meta);
+      await client.replyToThread(prId, p.threadId, text);
+      await client.setThreadStatus(prId, p.threadId, resolution === "fixed" ? "fixed" : "closed");
+      ledger[`resolved:${p.threadId}`] = p.threadId;
+      await saveLedger();
+      done.push(`  thread ${p.threadId} -> ${resolution === "fixed" ? "fixed" : "closed"}`);
+    } catch (err) {
+      failed.push(`  thread ${p.threadId} — ${(err as Error).message.slice(0, 160)}`);
+    }
+  }
+  const lines = [`resolved ${done.length} prr thread(s) on PR ${prId} as ${resolution}`];
+  lines.push(...done, ...skipped);
+  if (failed.length > 0) {
+    lines.push(`failed ${failed.length}:`);
+    lines.push(...failed);
+  }
+  return lines.join("\n");
+}
+
+function resolutionComment(resolution: "fixed" | "withdrawn", meta: RunMeta): string {
+  const where =
+    meta.iterationId !== undefined
+      ? `iteration ${meta.iterationId} (${meta.sourceSHA.slice(0, 10)})`
+      : meta.sourceSHA.slice(0, 10);
+  return resolution === "fixed"
+    ? `✅ **Resolved** — re-reviewed at ${where}; the issue described above is addressed. Reopen this thread if it is not.`
+    : `⚠️ **Withdrawn** — re-reviewed at ${where}; this finding does not hold and needs no change. Apologies for the noise.`;
 }

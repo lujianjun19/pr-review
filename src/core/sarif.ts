@@ -41,13 +41,16 @@ export function renderSarif(findings: Finding[], meta: RunMeta): string {
 
   const results = publishable.map((finding) => ({
     ruleId: finding.category,
-    level: SARIF_LEVEL[finding.severity],
+    // A defect the change did not introduce is context, not a gate on this change.
+    level: finding.preExisting ? ("note" as const) : SARIF_LEVEL[finding.severity],
     message: { text: `${finding.problem}\n\nFix: ${finding.fix}` },
     properties: {
       severity: finding.severity,
       "security-severity": SEVERITY_SCORE[finding.severity],
       fingerprint: finding.id,
       ...(finding.verification ? { verification: finding.verification } : {}),
+      ...(finding.preExisting ? { preExisting: true } : {}),
+      ...(finding.challenge ? { challenge: finding.challenge.outcome } : {}),
     },
     partialFingerprints: { prReviewFindingId: finding.id },
     locations: [

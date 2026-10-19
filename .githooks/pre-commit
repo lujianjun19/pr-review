@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks a commit that would publish secrets, personal data or private
+# organization details. Enable once per clone:  git config core.hooksPath .githooks
+exec node "$(git rev-parse --show-toplevel)/scripts/check-public-safety.mjs" --staged

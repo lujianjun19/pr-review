@@ -328,3 +328,35 @@ export async function grepAtRev(
   const matches = parseGrepOutput(isWorktree(sha) ? "" : sha, out);
   return { matches: matches.slice(0, opts.max), truncated: matches.length > opts.max };
 }
+
+/** Lists every file path in the tree of a revision. */
+export async function listTree(cwd: string, rev: string): Promise<string[]> {
+  const out = await run("git", ["ls-tree", "-r", "--name-only", "-z", rev], {
+    cwd,
+    allowFailure: true,
+  });
+  return splitZ(out);
+}
+
+/**
+ * Returns the subject and body of each commit in `base..head`, newest first.
+ *
+ * Used as the stated intent of a branch review, which has no pull request
+ * description. Capped because a long-lived branch would otherwise flood the
+ * payload with history nobody asked about.
+ */
+export async function commitMessages(
+  cwd: string,
+  base: string,
+  head: string,
+  max = 30,
+): Promise<string[]> {
+  const out = await run(
+    "git",
+    ["log", `--max-count=${max}`, "--format=%B%x00", `${base}..${head}`],
+    { cwd, allowFailure: true },
+  );
+  return splitZ(out)
+    .map((message) => message.trim())
+    .filter((message) => message.length > 0);
+}

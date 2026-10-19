@@ -2,10 +2,12 @@ import { AdoClient } from "../ado/client.ts";
 import { getCredential } from "../ado/auth.ts";
 import { parsePrUrl, parseRemoteUrl, remoteUrlFor, webUrlFor } from "../ado/url.ts";
 import type { AdoTarget } from "../ado/url.ts";
-import type { PolicyEvaluation, PullRequestStatus } from "../ado/client.ts";
+import type { PolicyEvaluation, PullRequestStatus, WorkItem } from "../ado/client.ts";
 import {
   WORKTREE,
+  commitMessages,
   fetchCommits,
+  listTree,
   listChanges,
   mergeBase,
   remoteUrl,
@@ -15,12 +17,30 @@ import {
   showFile,
 } from "../core/git.ts";
 import { triage } from "../core/triage.ts";
-import { buildBatches } from "../core/batch.ts";
+import { batchOptionsFor, buildBatches } from "../core/batch.ts";
 import { renderPayload } from "../core/payload.ts";
 import { loadRules } from "../core/rules.ts";
 import { collapseGeneratedDuplicates } from "../core/generated.ts";
 import { RunStore, runDirFor } from "../core/store.ts";
-import type { ChangedFile, ReviewScope, ReviewThread, RunMeta } from "../types.ts";
+import { intentExcerpt, renderIntent, type ChangeIntent, type WorkItemIntent } from "../core/intent.ts";
+import {
+  instructionFiles,
+  isReviewConfiguration,
+  renderGuidance,
+  selectGuidance,
+  type GuidanceRef,
+} from "../core/guidance.ts";
+import { collectPriorFindings, isOpenThreadStatus } from "../core/priorFindings.ts";
+import { computeRiskTier } from "../core/riskTier.ts";
+import type {
+  ChangedFile,
+  PriorFinding,
+  ReviewDepth,
+  ReviewScope,
+  ReviewThread,
+  RiskTier,
+  RunMeta,
+} from "../types.ts";
 import { TOOL_VERSION } from "../version.ts";
 
 export interface PrepareArgs {
@@ -38,7 +58,14 @@ export interface PrepareArgs {
   rule?: string;
   /** Discard verdicts and findings recorded by an earlier pass over the same revision. */
   reset?: boolean;
+  /** Review thoroughness; standard when absent. */
+  depth?: ReviewDepth;
 }
+
+export const DEPTHS: ReviewDepth[] = ["quick", "standard", "deep"];
+
+/** Most linked work items whose text is pulled into the intent document. */
+const MAX_WORK_ITEMS = 10;
 
 /** Resolves the pull request coordinates from a URL, or from origin plus a bare number. */
 async function resolveTarget(
@@ -78,7 +105,37 @@ interface ScopeResult {
   pullRequest?: unknown;
   policies?: OptionalEvidence<PolicyEvaluation>;
   builds?: OptionalEvidence<PullRequestStatus>;
+  intent?: ChangeIntent;
   credentialSource: string;
+}
+
+function fieldText(item: WorkItem, name: string): string | undefined {
+  const value = item.fields?.[name];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** Fetches the linked work items; a failure is a recorded gap, never a prepare failure. */
+async function loadWorkItems(
+  client: AdoClient,
+  prId: number,
+): Promise<{ items?: WorkItemIntent[]; error?: string }> {
+  try {
+    const ids = (await client.listPullRequestWorkItemIds(prId)).slice(0, MAX_WORK_ITEMS);
+    const items = await client.getWorkItems(ids);
+    return {
+      items: items.map((item) => ({
+        id: item.id,
+        type: fieldText(item, "System.WorkItemType"),
+        state: fieldText(item, "System.State"),
+        title: fieldText(item, "System.Title"),
+        description:
+          fieldText(item, "System.Description") ?? fieldText(item, "Microsoft.VSTS.TCM.ReproSteps"),
+        acceptanceCriteria: fieldText(item, "Microsoft.VSTS.Common.AcceptanceCriteria"),
+      })),
+    };
+  } catch (err) {
+    return { error: (err as Error).message.split("\n")[0].slice(0, 200) };
+  }
 }
 
 async function optionalEvidence<T>(load: () => Promise<T[]>): Promise<OptionalEvidence<T>> {
@@ -127,13 +184,14 @@ async function prepareAdoScope(args: PrepareArgs, root: string): Promise<ScopeRe
     items: [],
     error: projectId ? undefined : "Pull request metadata did not include a project id.",
   };
-  const [threads, changeEntries, builds, policies] = await Promise.all([
+  const [threads, changeEntries, builds, policies, workItems] = await Promise.all([
     client.listThreads(target.prId),
     client.listIterationChanges(target.prId, iteration.id, args.since),
     optionalEvidence(() => client.listPullRequestStatuses(target.prId)),
     projectId
       ? optionalEvidence(() => client.listPolicyEvaluations(target.prId, projectId))
       : Promise.resolve(unavailablePolicies),
+    loadWorkItems(client, target.prId),
   ]);
 
   const cred = await getCredential();
@@ -189,9 +247,17 @@ async function prepareAdoScope(args: PrepareArgs, root: string): Promise<ScopeRe
         description: it.description,
         sourceSHA: it.sourceRefCommit.commitId,
       })),
+      workItems: workItems.items ?? [],
+      ...(workItems.error ? { workItemsError: workItems.error } : {}),
     },
     policies,
     builds,
+    intent: {
+      title: pr.title,
+      description: pr.description ?? "",
+      ...(workItems.items ? { workItems: workItems.items } : {}),
+      ...(workItems.error ? { workItemsError: workItems.error } : {}),
+    },
     credentialSource: cred.source,
   };
 }
@@ -226,7 +292,9 @@ async function prepareLocalScope(args: PrepareArgs, root: string): Promise<Scope
   const baseRef = args.branch!;
   const base = await mergeBase(root, baseRef, "HEAD");
   const sourceSHA = await revParse(root, "HEAD");
+  const commits = await commitMessages(root, base, sourceSHA);
   return {
+    intent: { title: commits[0]?.split("\n")[0] ?? `${branch} vs ${baseRef}`, commits },
     meta: {
       toolVersion: TOOL_VERSION,
       createdAt: new Date().toISOString(),
@@ -257,11 +325,18 @@ export async function prepare(args: PrepareArgs): Promise<string> {
     );
   }
 
+  const depth = args.depth ?? "standard";
+  if (!DEPTHS.includes(depth)) {
+    throw new Error(`--depth must be one of ${DEPTHS.join(", ")}.`);
+  }
+
   const scope = isLocal
     ? await prepareLocalScope(args, root)
     : await prepareAdoScope(args, root);
 
-  const rules = await loadRules(root, args.rule);
+  // Review configuration comes from the base revision for every scope: a change
+  // under review must not be able to rewrite the rules it is reviewed against.
+  const rules = await loadRules(root, args.rule, { rev: scope.meta.baseSHA });
 
   let changes = await listChanges(root, scope.meta.baseSHA, scope.meta.sourceSHA);
   if (args.since !== undefined && scope.iterationPaths) {
@@ -280,18 +355,43 @@ export async function prepare(args: PrepareArgs): Promise<string> {
     );
     files = collapseGeneratedDuplicates(files, new Map(contentPairs));
   }
+  const preset = batchOptionsFor(depth);
   const batches = buildBatches(files, {
-    maxFiles: args.maxFiles ?? 10,
-    maxTokens: args.maxTokens ?? 25_000,
-    planFileLines: 50,
-    planGroupLines: 100,
+    ...preset,
+    ...(args.maxFiles !== undefined ? { maxFiles: args.maxFiles } : {}),
+    ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
   });
+
+  const reviewPaths = files.filter((f) => f.decision === "review").map((f) => f.path);
+  const baseTree = await listTree(root, scope.meta.baseSHA);
+  const guidanceContents = new Map<string, string>();
+  // Path-scoped instruction files declare their reach in front matter, so they
+  // are read before selection; everything else only once it is selected.
+  for (const path of instructionFiles(baseTree)) {
+    guidanceContents.set(path, await showFile(root, scope.meta.baseSHA, path));
+  }
+  const guidanceRefs = selectGuidance(baseTree, reviewPaths, guidanceContents);
+  for (const ref of guidanceRefs) {
+    if (!guidanceContents.has(ref.path)) {
+      guidanceContents.set(ref.path, await showFile(root, scope.meta.baseSHA, ref.path));
+    }
+  }
+  const configChanges = files.filter((f) => isReviewConfiguration(f.path)).map((f) => f.path);
+
+  const priorFindings = await collectPriorFindings(scope.threads, (path) =>
+    showFile(root, scope.meta.sourceSHA, path),
+  );
+  const riskTier = computeRiskTier(files, rules.alwaysHuman);
 
   const runDir = runDirFor(scope.meta);
   const meta: RunMeta = {
     ...scope.meta,
     runDir,
+    depth,
+    riskTier,
     ...(rules.sources.length > 0 ? { ruleSources: rules.sources } : {}),
+    ...(rules.maxLowFindings !== undefined ? { limits: { maxLowFindings: rules.maxLowFindings } } : {}),
+    ...(guidanceRefs.length > 0 ? { guidanceFiles: guidanceRefs.map((ref) => ref.path) } : {}),
   };
 
   const store = await RunStore.create(meta);
@@ -304,6 +404,12 @@ export async function prepare(args: PrepareArgs): Promise<string> {
   await store.writeThreads(scope.threads);
   await store.writeFiles(files);
   await store.writeBatches(batches);
+  await store.writePriorFindings(priorFindings);
+  const intentDoc = scope.intent ? renderIntent(scope.intent) : undefined;
+  if (intentDoc) await store.writeText("intent.md", intentDoc);
+  if (guidanceRefs.length > 0) {
+    await store.writeText("guidance.md", renderGuidance(guidanceRefs, guidanceContents));
+  }
 
   const fileMap = new Map(files.map((f) => [f.path, f]));
   for (const batch of batches) {
@@ -313,21 +419,30 @@ export async function prepare(args: PrepareArgs): Promise<string> {
       sourceSHA: meta.sourceSHA,
       files: fileMap,
       threads: scope.threads,
+      depth,
+      ...(intentDoc ? { intent: intentExcerpt(intentDoc) } : {}),
+      guidance: { refs: guidanceRefs, contents: guidanceContents },
+      priorFindings,
     });
     await store.writePayload(batch.payload, content);
   }
 
-  return formatSummary(
+  return formatSummary({
     meta,
     files,
     batches,
-    scope.threads.length,
-    scope.credentialSource,
-    args.reset ? 0 : carried,
-    rules.sources,
-    scope.policies,
-    scope.builds,
-  );
+    threadCount: scope.threads.length,
+    credSource: scope.credentialSource,
+    carried: args.reset ? 0 : carried,
+    ruleSources: rules.sources,
+    policies: scope.policies,
+    builds: scope.builds,
+    intent: scope.intent,
+    guidance: guidanceRefs,
+    configChanges,
+    priorFindings,
+    riskTier,
+  });
 }
 
 function evidenceSummary(
@@ -344,17 +459,26 @@ function evidenceSummary(
   return [...counts].map(([state, count]) => `${state} x${count}`).join(", ");
 }
 
-function formatSummary(
-  meta: RunMeta,
-  files: ChangedFile[],
-  batches: ReturnType<typeof buildBatches>,
-  threadCount: number,
-  credSource: string,
-  carried: number,
-  ruleSources: string[],
-  policies?: OptionalEvidence<PolicyEvaluation>,
-  builds?: OptionalEvidence<PullRequestStatus>,
-): string {
+interface SummaryInput {
+  meta: RunMeta;
+  files: ChangedFile[];
+  batches: ReturnType<typeof buildBatches>;
+  threadCount: number;
+  credSource: string;
+  carried: number;
+  ruleSources: string[];
+  policies?: OptionalEvidence<PolicyEvaluation>;
+  builds?: OptionalEvidence<PullRequestStatus>;
+  intent?: ChangeIntent;
+  guidance: GuidanceRef[];
+  configChanges: string[];
+  priorFindings: PriorFinding[];
+  riskTier: RiskTier;
+}
+
+function formatSummary(input: SummaryInput): string {
+  const { meta, files, batches, threadCount, credSource, carried, ruleSources, policies, builds } =
+    input;
   const counts = { review: 0, "stat-only": 0, skip: 0 } as Record<string, number>;
   for (const f of files) counts[f.decision]++;
 
@@ -390,6 +514,43 @@ function formatSummary(
   }
   if (ruleSources.length > 0) {
     lines.push(`  rules: ${ruleSources.join(", ")}`);
+  }
+  lines.push(`  depth: ${meta.depth ?? "standard"}`);
+  lines.push(
+    `  risk tier: ${input.riskTier.tier} (${input.riskTier.approvers} human approver(s) suggested)` +
+      (input.riskTier.reasons.length > 0 ? ` — ${input.riskTier.reasons.join("; ")}` : ""),
+  );
+  if (input.intent) {
+    const items = input.intent.workItems;
+    const parts = [
+      input.intent.description !== undefined
+        ? input.intent.description.trim()
+          ? "description"
+          : "empty description"
+        : undefined,
+      items ? `${items.length} work item(s)` : undefined,
+      input.intent.workItemsError ? "work items unavailable" : undefined,
+      input.intent.commits ? `${input.intent.commits.length} commit message(s)` : undefined,
+    ].filter(Boolean);
+    lines.push(`  intent: ${parts.join(", ") || "title only"} (intent.md)`);
+  }
+  if (input.guidance.length > 0) {
+    lines.push(`  guidance: ${input.guidance.map((ref) => ref.path).join(", ")} (guidance.md, base revision)`);
+  }
+  if (input.configChanges.length > 0) {
+    lines.push(
+      `  WARNING: this change edits review configuration (${input.configChanges.join(", ")}); ` +
+        "the base revision copy was applied. Review the edit itself as a finding candidate.",
+    );
+  }
+  if (input.priorFindings.length > 0) {
+    const open = input.priorFindings.filter((p) => isOpenThreadStatus(p.status));
+    const gone = open.filter((p) => p.evidenceStillPresent === false).length;
+    const replied = open.filter((p) => p.replies.length > 0).length;
+    lines.push(
+      `  prior prr findings: ${input.priorFindings.length} posted, ${open.length} open` +
+        ` · ${gone} with evidence gone (fix candidates) · ${replied} with replies (prior-findings.json)`,
+    );
   }
   if (meta.scope === "ado-pr") {
     lines.push(`  policies: ${evidenceSummary(policies)}`);
